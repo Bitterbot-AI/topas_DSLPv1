@@ -197,9 +197,20 @@ regularization:
 
 | Variant | d_model | Parameters | Use Case |
 |---------|---------|------------|----------|
-| tiny    | 320     | ~8M        | Fast prototyping |
-| small   | 480     | ~15M       | Default, balanced |
+| tiny    | 256     | ~3.5M      | Fast prototyping |
+| small   | 384     | ~15M       | Consumer hardware default |
+| **base**| **480** | **~24M**   | **24% solve rate achieved** |
 | large   | 640     | ~43M       | Maximum performance |
+
+> **Note on reported results:** The **24% solve rate** on ARC evaluation was achieved using the **Base (~24M)** configuration with `d_model=480`. The repository defaults to this configuration.
+
+### Implementation Notes
+
+**Dimension Choice:** The paper describes an idealized architecture with `d_model=512`, but during final training runs we settled on `d_model=480` which allows clean head division (480/8=60) and optimizes GPU memory utilization.
+
+**Parameter Growth:** The ~24M count in Base reflects the dual-stream architecture (separate Logic + Canvas cores) and the depth required for stable recursive loops.
+
+**Optimizer Deviation:** A critical change from the paper is the migration from AdamW to the **MuonClip optimizer** (Momentum-Orthogonalized updates). This significantly stabilized gradients through deep recursive steps compared to vanilla AdamW.
 
 ---
 

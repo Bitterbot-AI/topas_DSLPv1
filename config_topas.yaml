@@ -1,12 +1,12 @@
 # TOPAS-DSPL Configuration
 # Recursive architecture with Q-learning halting
-# Target: ~8M params
+# Target: ~24M params (Base variant)
 
 model:
   type: topas            # Use TOPAS model (vs "dspl" for V3)
 
   # Model architecture
-  d_model: 480           # Hidden dimension (~8M params)
+  d_model: 480           # Hidden dimension (~24M params, "base" variant)
   n_heads: 8             # Attention heads (480 / 8 = 60 dim per head)
   expansion: 4.0         # FFN expansion ratio
   dropout: 0.1
