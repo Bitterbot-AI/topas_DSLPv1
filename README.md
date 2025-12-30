@@ -100,7 +100,7 @@ Required for "Base" or "Large" variants and full 50k+ epoch runs.
 ### 1. Installation
 
 ```bash
-git clone https://github.com/Bitterbot/topas-dslp.git
+git clone https://github.com/Bitterbot-AI/topas-dslpv1.git
 cd topas-dslp
 python -m venv venv
 source venv/bin/activate  # Linux/Mac
