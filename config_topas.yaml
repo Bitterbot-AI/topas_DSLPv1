@@ -1,0 +1,86 @@
+# TOPAS-DSPL Configuration
+# Recursive architecture with Q-learning halting
+# Target: ~8M params
+
+model:
+  type: topas            # Use TOPAS model (vs "dspl" for V3)
+
+  # Model architecture
+  d_model: 480           # Hidden dimension (~8M params)
+  n_heads: 8             # Attention heads (480 / 8 = 60 dim per head)
+  expansion: 4.0         # FFN expansion ratio
+  dropout: 0.1
+
+  # Recursive processing
+  H_cycles: 3            # Outer H cycles (only last has grad)
+  L_cycles: 4            # Inner L cycles per H
+  L_layers: 2            # Number of blocks in reasoning module
+
+  # Q-learning halting
+  halt_max_steps: 16     # Max forward passes for adaptive compute
+  halt_exploration_prob: 0.1  # Exploration probability during training
+
+  # ARC-specific
+  max_demos: 3
+  img_size: 30
+  num_colors: 11         # 10 colors (0-9) + 1 PAD class
+  num_program_tokens: 4  # Multi-token program for complex transformations
+
+  # Puzzle embeddings (disabled for pretraining)
+  puzzle_emb_ndim: 0
+  num_tasks: 100000
+
+training:
+  # TOPAS uses its own data loading path
+  # data_mode left unset so model_cfg.type == "topas" branch is used
+  seed: 42
+  epochs_per_iter: 10    # Match TRM style: small multiplier, more epochs
+                         # 10 passes through 1000 groups = 10,000 puzzles per iter
+                         # = 625 batches @ batch_size=16
+                         # = ~7 optimizer steps per iter @ accumulation=88
+
+  # Training data
+  train_data_dir: "/mnt/d/Bitterbot/research/topas_dslp/data"
+  eval_data_dir: ""
+
+  # Eval dataset paths
+  train_challenges: ""
+  train_solutions: ""
+  eval_challenges: "/mnt/d/Bitterbot/research/topas_dslp/data/arc-agi_evaluation_challenges.json"
+  eval_solutions: "/mnt/d/Bitterbot/research/topas_dslp/data/arc-agi_evaluation_solutions.json"
+
+  output_dir: "./output_topas"
+  batch_size: 16         # Local batch size per forward pass
+  accumulation_steps: 88 # Effective batch = 16 * 88 = 1408
+  epochs: 50000          # More epochs to compensate for smaller epochs_per_iter
+  learning_rate: 0.0001
+  amp: true
+  log_interval: 10       # Log every N batches
+  eval_interval: 5       # Eval every 5 epochs
+
+regularization:
+  weight_decay: 0.0001
+  ema: true
+  ema_decay: 0.999
+  stream_dropout: 0.1
+  puzzle_emb_lr: 0.01
+  puzzle_emb_wd: 0.01
+  lr_warmup_steps: 500
+  lr_min_ratio: 0.01
+  freeze_weights: false
+
+loss_weights:
+  primary: 1.0
+  deep_supervision: 1.0
+  q_halt: 0.1            # Q-learning halting loss weight
+  logic_consistency: 0.1
+  halting: 0.1
+  complexity: 0.01
+  change_weight: 1.0     # Disabled (1.0 = no extra weight for changed pixels)
+  object_count: 0.5
+  centroid: 0.0          # Disabled - revisit with per-color centroids later
+
+logging:
+  experiment_name: "topas_8m_v2"
+  use_tensorboard: true
+  vis_interval: 5

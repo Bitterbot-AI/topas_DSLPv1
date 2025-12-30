@@ -1,0 +1,23 @@
+# TOPAS-DSPL Requirements
+# Python 3.10+ recommended
+
+# Core ML Framework
+torch>=2.0.0
+numpy>=1.24.0
+
+# Configuration
+pyyaml>=6.0
+pydantic>=2.0.0
+
+# Training utilities
+tqdm>=4.65.0
+tensorboard>=2.13.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Optional: For distributed training
+# accelerate>=0.20.0
+
+# Optional: For mixed precision training (included in torch)
+# No additional package needed - uses torch.cuda.amp
