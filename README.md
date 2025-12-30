@@ -7,7 +7,7 @@
 [![TOPAS Architecture](https://img.shields.io/badge/Architecture-TOPAS-orange)](https://zenodo.org/records/17683673)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> **Abstract:** TOPAS-DSPL represents the **distilled neural essence** of the comprehensive TOPAS Neuro-Symbolic architecture. By stripping away the memory systems, symbolic rails, and the scaffolding of the full system, we isolate the specific contribution of the Dual-Stream Programmatic Learner (DSPL). Despite functioning here as a standalone neural baseline without neuro-symbolic aids, this streamlined core demonstrates remarkable robust reasoning—achieving a **24% Solve Rate** on the ARC evaluation set. This validates the fundamental power of the **Bicameral Latent Space** independent of auxiliary scaffolding.
+> **Abstract:** TOPAS-DSPL represents the **distilled neural essence** of the comprehensive TOPAS Neuro-Symbolic architecture. By stripping away the memory systems, symbolic rails, and the scaffolding of the full system, we isolate the specific contribution of the Dual-Stream Programmatic Learner (DSPL). Despite functioning here as a standalone neural baseline without neuro-symbolic aids, this streamlined core demonstrates remarkable robust reasoning, achieving a **24% Solve Rate** on the ARC evaluation set. This validates the fundamental power of the **Bicameral Latent Space** independent of auxiliary scaffolding.
 
 ---
 
