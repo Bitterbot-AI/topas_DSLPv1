@@ -20,7 +20,6 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 # Import components from existing codebase
-from sparse_embedding import CastedSparseEmbedding
 from logic_core import LogicCore
 from canvas_core import CanvasCore
 
@@ -228,19 +227,8 @@ class TOPASDSPLModel(nn.Module):
         self.grid_size_embed = nn.Embedding(img_size + 1, d_model // 2)
         self.grid_size_proj = nn.Linear(d_model, d_model)
 
-        # Puzzle Embedding (Long-term memory/Prior)
-        if puzzle_emb_ndim > 0:
-            self.puzzle_emb = CastedSparseEmbedding(
-                num_embeddings=num_tasks,
-                embedding_dim=puzzle_emb_ndim,
-                batch_size=32,
-                init_std=0.0,
-                cast_to=torch.float32
-            )
-            if puzzle_emb_ndim != d_model:
-                self.puzzle_proj = nn.Linear(puzzle_emb_ndim, d_model)
-        else:
-            self.puzzle_emb = None
+        # Puzzle Embedding (disabled - kept for future experiments)
+        self.puzzle_emb = None
 
         # --- 2. The Cores (Processors) ---
 

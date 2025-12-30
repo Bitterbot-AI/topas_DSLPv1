@@ -12,7 +12,6 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler, Sampler
 from torch import optim
 from topas_dslp_model import TOPASDSPLModel
 from logger import DSPLLogger
-from sparse_embedding import CastedSparseEmbeddingSignSGD
 from ema import EMAHelper
 from puzzle_dataset import PuzzleDataset
 
@@ -1035,31 +1034,12 @@ def train(config_path="config.yaml", resume_checkpoint=None):
     logger.info(f"Gradient accumulation: {accumulation_steps} steps")
     logger.info(f"LR warmup: {lr_warmup_steps} steps, min_ratio: {lr_min_ratio}")
 
-    # Dual optimizer setup: AdamAtan2 for main model + SignSGD for puzzle embeddings
-    # List of (optimizer, base_lr) tuples
+    # Optimizer setup
     optimizers = []
     optimizer_lrs = []
 
-    if puzzle_emb_ndim > 0 and raw_model.puzzle_emb is not None:
-        # SignSGD for puzzle embeddings (sparse updates)
-        puzzle_emb_lr = reg_cfg.get("puzzle_emb_lr", 0.01)
-        puzzle_emb_wd = reg_cfg.get("puzzle_emb_wd", 0.01)
-        puzzle_emb_optim = CastedSparseEmbeddingSignSGD(
-            raw_model.puzzle_emb.buffers(),
-            lr=1e-10,  # Will be set per-step by scheduler (must be >0 for init)
-            weight_decay=puzzle_emb_wd
-        )
-        optimizers.append(puzzle_emb_optim)
-        optimizer_lrs.append(puzzle_emb_lr)
-        logger.info(f"Using SignSGD for puzzle embeddings: base_lr={puzzle_emb_lr}, wd={puzzle_emb_wd}")
-
     if freeze_weights:
-        # Freeze main model weights - only train puzzle embeddings
-        logger.info("FREEZE_WEIGHTS mode: Freezing main model, only training puzzle embeddings")
-        for p in model.parameters():
-            p.requires_grad_(False)
-        if puzzle_emb_ndim == 0:
-            raise ValueError("freeze_weights=True requires puzzle_emb_ndim > 0")
+        raise ValueError("freeze_weights=True is not supported (puzzle embeddings disabled)")
     else:
         # AdamW + MuonClip for main model (proven stable)
         base_optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
@@ -1497,10 +1477,7 @@ def train(config_path="config.yaml", resume_checkpoint=None):
                         scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     for opt in optimizers:
-                        if isinstance(opt, CastedSparseEmbeddingSignSGD):
-                            opt.step()
-                        else:
-                            scaler.step(opt)
+                        scaler.step(opt)
                     scaler.update()
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
