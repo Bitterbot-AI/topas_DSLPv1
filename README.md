@@ -7,7 +7,7 @@
 [![TOPAS Architecture](https://img.shields.io/badge/Architecture-TOPAS-orange)](https://zenodo.org/records/17683673)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> **Abstract:** TOPAS-DSPL represents the **distilled neural essence** of the comprehensive TOPAS Neuro-Symbolic architecture. By stripping away the memory systems, symbolic rails, and the scaffolding of the full system, we isolate the specific contribution of the Dual-Stream Programmatic Learner (DSPL). Despite functioning here as a standalone neural baseline without neuro-symbolic aids, this streamlined core demonstrates remarkable robust reasoning, achieving a **24% Solve Rate** on the ARC evaluation set. This validates the fundamental power of the **Bicameral Latent Space** independent of auxiliary scaffolding.
+> **Abstract:** TOPAS-DSPL represents the **distilled neural essence** of the comprehensive TOPAS Neuro-Symbolic architecture. By stripping away the memory systems, symbolic rails, and the scaffolding of the full system, we isolate the specific contribution of the Dual-Stream Programmatic Learner (DSPL). Despite functioning here as a standalone neural baseline without neuro-symbolic aids, this streamlined core demonstrates remarkable robust reasoning, achieving a **24% Solve Rate** on the **ARC-AGI-2** public evaluation set. This validates the fundamental power of the **Bicameral Latent Space** independent of auxiliary scaffolding.
 
 ---
 
@@ -115,8 +115,8 @@ TOPAS-DSPL requires **1000 augmented puzzle groups** for training, generated usi
 **Data Structure:**
 ```
 data/
-├── arc-agi_evaluation_challenges.json   # For evaluation
-├── arc-agi_evaluation_solutions.json    # For evaluation
+├── arc-agi_evaluation_challenges.json   # ARC-AGI-2 evaluation (120 tasks)
+├── arc-agi_evaluation_solutions.json    # ARC-AGI-2 solutions
 ├── group_0000/                          # Augmented puzzle group
 │   ├── puzzle_*.json                    # Multiple augmented versions
 │   └── metadata.json
@@ -126,15 +126,11 @@ data/
 ```
 
 **Setup:**
-```bash
-# 1. Download evaluation set
-mkdir -p data
-wget -O data/arc-agi_evaluation_challenges.json \
-  https://raw.githubusercontent.com/fchollet/ARC-AGI/master/data/evaluation/arc-agi_evaluation_challenges.json
-wget -O data/arc-agi_evaluation_solutions.json \
-  https://raw.githubusercontent.com/fchollet/ARC-AGI/master/data/evaluation/arc-agi_evaluation_solutions.json
 
-# 2. Generate augmented training data
+The **ARC-AGI-2 evaluation set** (120 tasks) is included in the `data/` folder of this repository.
+
+```bash
+# Generate augmented training data (1000 groups)
 # Clone TRM repo and use their data builder:
 git clone https://github.com/alexjm/TinyRecursiveModels.git
 cd TinyRecursiveModels
@@ -202,7 +198,7 @@ regularization:
 | **base**| **480** | **~24M**   | **24% solve rate achieved** |
 | large   | 640     | ~43M       | Maximum performance |
 
-> **Note on reported results:** The **24% solve rate** on ARC evaluation was achieved using the **Base (~24M)** configuration with `d_model=480`. The repository defaults to this configuration.
+> **Note on reported results:** The **24% solve rate** on **ARC-AGI-2** public evaluation was achieved using the **Base (~24M)** configuration with `d_model=480`. The repository defaults to this configuration.
 
 ### Implementation Notes
 
