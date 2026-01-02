@@ -155,7 +155,8 @@ class TOPASEvaluator:
                     # Crop to original size and convert to numpy
                     pred_np = pred_orig[0, :test_h, :test_w].cpu().numpy().astype(int)
 
-                    # Handle any remaining PAD tokens (shouldn't be in valid area)
+                    # Handle any remaining PAD tokens (map to background, not random color)
+                    pred_np[pred_np >= 10] = 0  # PAD → Background
                     pred_np = np.clip(pred_np, 0, 9)
 
                     # Vote (confidence-weighted)
