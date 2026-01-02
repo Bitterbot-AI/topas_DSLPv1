@@ -139,6 +139,11 @@ class TOPASEvaluator:
                     # Get prediction
                     pred_grid = logits.argmax(dim=1)  # [1, H, W]
 
+                    # Calculate confidence score (mean probability of predicted pixels)
+                    probs = F.softmax(logits, dim=1)  # [1, C, H, W]
+                    pred_probs = probs.gather(1, pred_grid.unsqueeze(1))  # [1, 1, H, W]
+                    confidence = pred_probs[:, :, :test_h, :test_w].mean().item()
+
                     # Inverse color permutation
                     if color_map is not None:
                         inv_color_map = {v: k for k, v in color_map.items()}
@@ -153,9 +158,9 @@ class TOPASEvaluator:
                     # Handle any remaining PAD tokens (shouldn't be in valid area)
                     pred_np = np.clip(pred_np, 0, 9)
 
-                    # Vote
+                    # Vote (confidence-weighted)
                     grid_hash = self._hash_grid(pred_np)
-                    votes[grid_hash] += 1
+                    votes[grid_hash] += confidence
                     grid_cache[grid_hash] = pred_np
 
                 except Exception as e:
@@ -175,7 +180,9 @@ class TOPASEvaluator:
         results = [grid_cache[h] for h in top_hashes]
 
         if self.verbose:
-            print(f"  > Top vote: {votes.most_common(1)[0][1]}/{sum(votes.values())} votes")
+            top_conf = votes.most_common(1)[0][1]
+            total_conf = sum(votes.values())
+            print(f"  > Top vote: {top_conf:.3f}/{total_conf:.3f} confidence ({len(votes)} unique predictions)")
 
         return results
 
