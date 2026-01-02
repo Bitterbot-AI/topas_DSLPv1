@@ -1,0 +1,75 @@
+# TOPAS-DSPL Configuration - TPU v5e-8
+# Usage: python train.py --config config_topas_tpu.yaml --tpu
+
+model:
+  type: topas
+  d_model: 480
+  n_heads: 8
+  expansion: 4.0
+  dropout: 0.1
+  H_cycles: 3
+  L_cycles: 4
+  L_layers: 2
+  halt_max_steps: 16
+  halt_exploration_prob: 0.1
+  max_demos: 3
+  img_size: 30
+  num_colors: 11
+  num_program_tokens: 4
+  puzzle_emb_ndim: 0
+  num_tasks: 100000
+
+training:
+  seed: 42
+  epochs_per_iter: 10
+
+  # TPU-optimized aggressive settings (16GB HBM per core × 8 cores)
+  # 24M model + 30x30 grids = ~4GB/core at batch 1024
+  batch_size: 1024
+  accumulation_steps: 1  # No accumulation needed, effective batch = 1024 × 8 = 8192
+
+  # Step-based evaluation schedule
+  first_eval_step: 10000
+  eval_step_interval: 1000
+  eval_interval: 0
+
+  # Data paths
+  train_data_dir: "./data"
+  eval_data_dir: ""
+  train_challenges: ""
+  train_solutions: ""
+  eval_challenges: "./data/arc-agi_evaluation_challenges.json"
+  eval_solutions: "./data/arc-agi_evaluation_solutions.json"
+
+  output_dir: "./output_topas_tpu"
+  epochs: 50000
+  learning_rate: 0.0001
+  amp: false             # TPU uses bfloat16 natively, no AMP needed
+  log_interval: 10
+
+regularization:
+  weight_decay: 0.0001
+  ema: true
+  ema_decay: 0.999
+  stream_dropout: 0.1
+  puzzle_emb_lr: 0.01
+  puzzle_emb_wd: 0.01
+  lr_warmup_steps: 500
+  lr_min_ratio: 0.01
+  freeze_weights: false
+
+loss_weights:
+  primary: 1.0
+  deep_supervision: 1.0
+  q_halt: 0.1
+  logic_consistency: 0.1
+  halting: 0.1
+  complexity: 0.01
+  change_weight: 1.0
+  object_count: 0.5
+  centroid: 0.0
+
+logging:
+  experiment_name: "topas_base_tpu"
+  use_tensorboard: true
+  vis_interval: 5

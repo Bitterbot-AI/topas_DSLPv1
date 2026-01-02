@@ -15,6 +15,16 @@ from logger import DSPLLogger
 from ema import EMAHelper
 from puzzle_dataset import PuzzleDataset
 
+# TPU support (optional - only imported if --tpu flag is used)
+_TPU_AVAILABLE = False
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    _TPU_AVAILABLE = True
+except ImportError:
+    pass
+
 # Import optimizers from parent directory
 import sys
 _v3_code_dir = os.path.dirname(os.path.abspath(__file__))
@@ -883,12 +893,14 @@ def evaluate_with_ttt(model, eval_loader, device, ttt_config, num_classes=11, ve
     }
 
 
-def train(config_path="config.yaml", resume_checkpoint=None):
+def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_cores=8):
     """Main training function.
 
     Args:
         config_path: Path to config file (default: config.yaml)
         resume_checkpoint: Path to checkpoint file to resume from (overrides config)
+        use_tpu: Whether to use TPU instead of GPU
+        tpu_cores: Number of TPU cores to use (default: 8 for v5e-8)
     """
     # Load configuration
     with open(config_path, 'r') as f:
@@ -903,7 +915,14 @@ def train(config_path="config.yaml", resume_checkpoint=None):
     reg_cfg = config.get("regularization", {})
     log_cfg = config.get("logging", {})
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Device selection: TPU > CUDA > CPU
+    if use_tpu:
+        if not _TPU_AVAILABLE:
+            raise RuntimeError("TPU requested but torch_xla not available. Install: pip install torch_xla")
+        device = xm.xla_device()
+        print(f"TPU device: {device}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Initialize logger
     logger = DSPLLogger(
@@ -914,15 +933,19 @@ def train(config_path="config.yaml", resume_checkpoint=None):
     logger.info(f"Using device: {device}")
     logger.log_config(config)
 
-    # DDP setup
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-
-    if world_size > 1:
-        torch.distributed.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        torch.cuda.set_device(local_rank)
-        device = torch.device("cuda", local_rank)
+    # Distributed setup (TPU or GPU)
+    if use_tpu:
+        world_size = xm.xrt_world_size()
+        rank = xm.get_ordinal()
+        logger.info(f"TPU distributed: rank {rank}/{world_size}")
+    else:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        rank = int(os.environ.get("RANK", "0"))
+        if world_size > 1:
+            torch.distributed.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            torch.cuda.set_device(local_rank)
+            device = torch.device("cuda", local_rank)
 
     # Build dataset and dataloader - TOPAS mode with IterableDataset (like TRM)
     train_dir = train_cfg.get("train_data_dir", train_cfg.get("augmented_data_dir"))
@@ -973,8 +996,14 @@ def train(config_path="config.yaml", resume_checkpoint=None):
     train_cfg["_topas_mode"] = True
     logger.info(f"Train: {num_train_groups} groups, {num_train_tasks} puzzles")
 
-    # No DataLoader needed - PuzzleDataset is already batched
-    # We iterate directly over the dataset
+    # TPU: Wrap with ParallelLoader for async prefetching
+    if use_tpu:
+        # Create a simple DataLoader wrapper for ParallelLoader compatibility
+        train_loader = DataLoader(train_data, batch_size=None, num_workers=0)
+        train_loader = pl.ParallelLoader(train_loader, [device]).per_device_loader(device)
+        logger.info("TPU: Using ParallelLoader for async data prefetching")
+    else:
+        train_loader = train_data  # Direct iteration for GPU
 
     # Calculate total number of tasks for puzzle embeddings
     # IterableDataset doesn't have len(), use metadata instead
@@ -1120,8 +1149,14 @@ def train(config_path="config.yaml", resume_checkpoint=None):
         logger.info(f"EMA enabled: decay={ema_decay}")
 
     # Automatic Mixed Precision
-    use_amp = train_cfg.get("amp", True) and torch.cuda.is_available()
-    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+    # Note: TPU uses bfloat16 natively, no scaler needed
+    if use_tpu:
+        use_amp = False  # TPU handles precision internally
+        scaler = None
+        logger.info("TPU mode: Using native bfloat16 precision")
+    else:
+        use_amp = train_cfg.get("amp", True) and torch.cuda.is_available()
+        scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
     # Loss weights
     lw = config.get("loss_weights", {})
@@ -1168,8 +1203,8 @@ def train(config_path="config.yaml", resume_checkpoint=None):
         accum_losses = {k: 0.0 for k in epoch_losses}
         accum_metrics = {'correct': 0, 'total_px': 0, 'solves': 0, 'count': 0}
 
-        # Iterate directly over IterableDataset (already batched)
-        for batch_idx, batch in enumerate(train_data):
+        # Iterate over train_loader (ParallelLoader on TPU, direct on GPU)
+        for batch_idx, batch in enumerate(train_loader):
             # NOTE: TOPAS-DSPL now uses v3 grid format (tuples), not sequence format (dicts)
             # The old sequence-based TOPAS mode is disabled - using unified V3 path with TOPAS detection
             is_topas_mode = False  # Disabled: now using v3 tuples with is_topas detection below
@@ -1236,7 +1271,10 @@ def train(config_path="config.yaml", resume_checkpoint=None):
 
                 # Optimizer step
                 if (batch_idx + 1) % accumulation_steps == 0:
-                    if use_amp:
+                    if use_tpu:
+                        # TPU: Use xm.optimizer_step for gradient sync across cores
+                        xm.optimizer_step(optimizer)
+                    elif use_amp:
                         scaler.step(optimizer)
                         scaler.update()
                     else:
@@ -1472,7 +1510,12 @@ def train(config_path="config.yaml", resume_checkpoint=None):
                         param_group['lr'] = current_lr
 
                 # Clip gradients and step optimizer
-                if use_amp:
+                if use_tpu:
+                    # TPU: Use xm.optimizer_step for gradient sync across cores
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    for opt in optimizers:
+                        xm.optimizer_step(opt)
+                elif use_amp:
                     for opt in optimizers:
                         scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -1738,5 +1781,11 @@ if __name__ == "__main__":
                         help='Path to config file (default: config.yaml)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from (overrides config)')
+    # TPU support
+    parser.add_argument('--tpu', action='store_true',
+                        help='Use TPU instead of GPU (requires torch_xla)')
+    parser.add_argument('--tpu-cores', type=int, default=8,
+                        help='Number of TPU cores (default: 8 for v5e-8)')
     args = parser.parse_args()
-    train(config_path=args.config, resume_checkpoint=args.resume)
+    train(config_path=args.config, resume_checkpoint=args.resume,
+          use_tpu=args.tpu, tpu_cores=args.tpu_cores)

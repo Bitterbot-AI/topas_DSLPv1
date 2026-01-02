@@ -93,6 +93,28 @@ Required for "Base" or "Large" variants and full 50k+ epoch runs.
   - Precision: bf16 recommended for recursive stability
 - **Expected Speed:** ~15+ iters/sec (linear scaling via DDP)
 
+### TPU Setup (Google Cloud)
+
+For maximum throughput on the Base variant.
+
+- **TPU:** v5e-8 (8 cores, 16GB HBM per core)
+- **Config:** `config_topas_tpu.yaml`
+  - Batch Size: 1024 per core (8192 effective)
+  - Precision: Native bfloat16
+ 
+```bash
+# Install TPU dependencies
+pip install torch_xla
+
+# Launch training
+python train.py --config config_topas_tpu.yaml --tpu
+```
+
+**Key TPU optimizations:**
+- `ParallelLoader` for async data prefetching
+- `xm.optimizer_step()` for gradient synchronization across cores
+- Native bfloat16 precision (no AMP scaler needed)
+
 ---
 
 ## Getting Started
@@ -229,7 +251,8 @@ Key metrics:
 
 ```
 topas_dslp/
-├── config_topas.yaml      # Training configuration
+├── config_topas.yaml      # GPU training configuration
+├── config_topas_tpu.yaml  # TPU training configuration
 ├── train.py               # Main training script
 ├── topas_dslp_model.py    # TOPAS-DSPL model architecture
 ├── topas_evaluator.py     # TTT + TTA evaluation
