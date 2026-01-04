@@ -104,7 +104,7 @@ class CanvasCoreLayer(nn.Module):
 
         # Prepare mask for grid operations [B, 1, H, W]
         if valid_mask is not None:
-            mask_grid = valid_mask.transpose(1, 2).view(B, 1, H, W)
+            mask_grid = valid_mask.transpose(1, 2).reshape(B, 1, H, W)
         else:
             mask_grid = None
 
@@ -116,7 +116,7 @@ class CanvasCoreLayer(nn.Module):
             x_norm1 = x_norm1 * valid_mask
 
         # Reshape tokens to grid: [B, H*W, D] -> [B, D, H, W]
-        x_grid = x_norm1.transpose(1, 2).view(B, D, H, W)
+        x_grid = x_norm1.transpose(1, 2).reshape(B, D, H, W)
 
         # HARDENING: Mask conv INPUT to prevent boundary bleeding
         if mask_grid is not None:
@@ -139,7 +139,7 @@ class CanvasCoreLayer(nn.Module):
             h = h * mask_grid  # Mask output of block 2
 
         # Reshape back to tokens: [B, D, H, W] -> [B, H*W, D]
-        local_conv_out = h.view(B, D, C_len).transpose(1, 2)
+        local_conv_out = h.reshape(B, D, C_len).transpose(1, 2)
 
         # Residual connection
         x = x + self.dropout(local_conv_out)

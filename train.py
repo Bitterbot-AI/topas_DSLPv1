@@ -1086,7 +1086,7 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
     start_step = 0  # Global step counter for LR scheduling
     if resume_checkpoint and os.path.exists(resume_checkpoint):
         logger.info(f"Resuming from checkpoint: {resume_checkpoint}")
-        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        checkpoint = torch.load(resume_checkpoint, map_location=device, weights_only=False)
         model_state = checkpoint['model_state_dict']
         if hasattr(model, 'module'):
             model.module.load_state_dict(model_state, strict=False)

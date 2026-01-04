@@ -12,6 +12,8 @@ Compatible with TOPASDSPLModel from topas_dslp_model.py
 import copy
 import itertools
 import json
+import math
+import os
 import random
 from collections import Counter
 from typing import Dict, List, Optional, Tuple, Any
@@ -22,6 +24,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
+
+# Visualization imports (optional - graceful fallback if not available)
+try:
+    from visualization import (
+        plot_grid, create_error_map, plot_error_map, ARC_CMAP, ERROR_CMAP
+    )
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    VIZ_AVAILABLE = True
+except ImportError:
+    VIZ_AVAILABLE = False
 
 # Constants
 ARC_GRID_SIZE = 30
@@ -421,7 +434,8 @@ def evaluate_arc_submission(
     enable_ttt: bool = True,
     enable_color_perm: bool = False,
     num_color_perms: int = 10,
-    verbose: bool = True
+    verbose: bool = True,
+    viz_path: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Evaluate model on ARC challenge set with TTT + TTA.
@@ -437,6 +451,7 @@ def evaluate_arc_submission(
         enable_color_perm: Whether to use color permutation TTA
         num_color_perms: Number of color permutations
         verbose: Print progress
+        viz_path: Optional path to save PDF visualization
 
     Returns:
         Dict with 'predictions' and optionally 'accuracy' metrics
@@ -457,6 +472,9 @@ def evaluate_arc_submission(
     predictions = {}
     correct = 0
     total = 0
+
+    # Visualization data collection
+    viz_data = [] if viz_path and VIZ_AVAILABLE else None
 
     task_ids = list(challenges.keys())
     iterator = tqdm(task_ids, desc="Evaluating") if verbose else task_ids
@@ -491,9 +509,30 @@ def evaluate_arc_submission(
             # Check accuracy if solutions available
             if solutions and task_id in solutions:
                 expected = np.array(solutions[task_id][test_idx])
-                if np.array_equal(preds[0], expected):
+                is_correct = np.array_equal(preds[0], expected)
+                if is_correct:
                     correct += 1
                 total += 1
+
+                # Dopamine logging
+                if verbose:
+                    status = "SOLVED" if is_correct else "Failed"
+                    icon = "+" if is_correct else "-"
+                    acc_pct = (correct / total * 100) if total > 0 else 0.0
+                    print(f"  [{icon}] {task_id}[{test_idx}]: {status} | ACC: {correct}/{total} ({acc_pct:.1f}%)")
+
+                # Collect visualization data
+                if viz_data is not None:
+                    viz_data.append({
+                        'task_id': task_id,
+                        'test_idx': test_idx,
+                        'demos_in': [np.array(p['input']) for p in puzzle['train']],
+                        'demos_out': [np.array(p['output']) for p in puzzle['train']],
+                        'test_input': np.array(test_case['input']),
+                        'prediction': preds[0],
+                        'target': expected,
+                        'is_correct': is_correct
+                    })
 
         predictions[task_id] = task_preds
 
@@ -508,7 +547,159 @@ def evaluate_arc_submission(
         if verbose:
             print(f"\nAccuracy: {correct}/{total} = {accuracy*100:.2f}%")
 
+    # Generate PDF visualization
+    if viz_data and viz_path:
+        _generate_eval_pdf(viz_data, viz_path, correct, total, verbose)
+
     return results
+
+
+def _generate_eval_pdf(viz_data: List[Dict], output_path: str, correct: int, total: int, verbose: bool = True):
+    """
+    Generate a PDF visualization of evaluation results.
+
+    Args:
+        viz_data: List of dicts with task visualization data
+        output_path: Path to save PDF
+        correct: Number of correct predictions
+        total: Total predictions
+        verbose: Print status messages
+    """
+    if not VIZ_AVAILABLE:
+        if verbose:
+            print("Warning: Visualization not available (matplotlib not installed)")
+        return
+
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+
+    # Sort: correct tasks first, then by task_id
+    viz_data.sort(key=lambda x: (-int(x['is_correct']), x['task_id']))
+
+    tasks_per_page = 5
+    n_pages = math.ceil(len(viz_data) / tasks_per_page)
+
+    if verbose:
+        print(f"\nGenerating visualization PDF: {output_path}")
+
+    with PdfPages(output_path) as pdf:
+        for page in range(n_pages):
+            start_idx = page * tasks_per_page
+            end_idx = min(start_idx + tasks_per_page, len(viz_data))
+            page_data = viz_data[start_idx:end_idx]
+
+            # 6 columns: Demo1 In, Demo1 Out, Test In, Prediction, Target, Error Map
+            fig, axes = plt.subplots(len(page_data), 6, figsize=(16, 3 * len(page_data)))
+            if len(page_data) == 1:
+                axes = axes.reshape(1, -1)
+
+            for row, data in enumerate(page_data):
+                pred = data['prediction']
+                target = data['target']
+                test_input = data['test_input']
+
+                # Demo 1 (first demo pair)
+                if len(data['demos_in']) > 0:
+                    plot_grid(axes[row, 0], data['demos_in'][0], "Demo In")
+                    plot_grid(axes[row, 1], data['demos_out'][0], "Demo Out")
+                else:
+                    axes[row, 0].axis('off')
+                    axes[row, 1].axis('off')
+
+                # Test input
+                plot_grid(axes[row, 2], test_input, "Test Input")
+
+                # Prediction with status
+                status = "CORRECT" if data['is_correct'] else "WRONG"
+                color = 'green' if data['is_correct'] else 'red'
+                plot_grid(axes[row, 3], pred, f"Pred ({status})")
+                axes[row, 3].title.set_color(color)
+
+                # Target
+                plot_grid(axes[row, 4], target, "Target")
+
+                # Error map
+                error_map = create_error_map(pred, target, pad_class=10)
+                plot_error_map(axes[row, 5], error_map, "Error Map")
+
+                # Add task ID as row label
+                axes[row, 0].set_ylabel(f"{data['task_id']}[{data['test_idx']}]",
+                                        fontsize=8, rotation=0, ha='right', va='center')
+
+            # Page title
+            page_correct = sum(1 for d in page_data if d['is_correct'])
+            fig.suptitle(
+                f"TOPAS Evaluation Results | Page {page + 1}/{n_pages} | "
+                f"Tasks {start_idx + 1}-{end_idx} | {page_correct}/{len(page_data)} correct on page",
+                fontsize=12
+            )
+
+            plt.tight_layout(rect=[0.02, 0, 1, 0.97])
+            pdf.savefig(fig, dpi=100)
+            plt.close(fig)
+
+        # Summary page
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+        # Accuracy pie chart
+        axes[0, 0].pie([correct, total - correct],
+                       labels=['Correct', 'Incorrect'],
+                       colors=['#2ECC40', '#FF4136'],
+                       autopct='%1.1f%%',
+                       startangle=90)
+        axes[0, 0].set_title(f'Exact Match: {correct}/{total} ({correct/total*100:.1f}%)')
+
+        # Correct vs Incorrect bar
+        axes[0, 1].barh(['Correct', 'Incorrect'], [correct, total - correct],
+                        color=['#2ECC40', '#FF4136'])
+        axes[0, 1].set_xlabel('Count')
+        axes[0, 1].set_title('Task Results')
+
+        # Error type breakdown (aggregate)
+        total_wrong_color = 0
+        total_missed = 0
+        total_false_pos = 0
+        for data in viz_data:
+            error_map = create_error_map(data['prediction'], data['target'], pad_class=10)
+            total_wrong_color += (error_map == 1).sum()
+            total_missed += (error_map == 2).sum()
+            total_false_pos += (error_map == 3).sum()
+
+        axes[1, 0].bar(['Wrong Color', 'Missed', 'False Pos'],
+                       [total_wrong_color, total_missed, total_false_pos],
+                       color=['#FF4136', '#0074D9', '#FFDC00'])
+        axes[1, 0].set_ylabel('Pixel Count')
+        axes[1, 0].set_title('Error Type Breakdown (All Tasks)')
+
+        # Legend
+        axes[1, 1].axis('off')
+        legend_text = (
+            "Error Map Legend:\n"
+            "─────────────────\n"
+            "Black  = Correct\n"
+            "Red    = Wrong Color\n"
+            "Blue   = Missed (should be colored)\n"
+            "Yellow = False Positive (extra color)\n"
+            "Gray   = Padding\n"
+            "\n"
+            f"Total Tasks: {total}\n"
+            f"Correct: {correct} ({correct/total*100:.1f}%)\n"
+            f"Wrong Color Pixels: {total_wrong_color}\n"
+            f"Missed Pixels: {total_missed}\n"
+            f"False Positive Pixels: {total_false_pos}"
+        )
+        axes[1, 1].text(0.1, 0.5, legend_text, transform=axes[1, 1].transAxes,
+                        fontsize=12, verticalalignment='center',
+                        family='monospace',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+        fig.suptitle('Evaluation Summary', fontsize=14)
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        pdf.savefig(fig, dpi=100)
+        plt.close(fig)
+
+    if verbose:
+        print(f"Saved visualization to: {output_path}")
 
 
 def save_submission(predictions: Dict, output_path: str):
@@ -533,19 +724,20 @@ if __name__ == "__main__":
     parser.add_argument("--challenges", type=str, required=True, help="Challenges JSON path")
     parser.add_argument("--solutions", type=str, default=None, help="Solutions JSON path")
     parser.add_argument("--output", type=str, default="submission.json", help="Output path")
-    parser.add_argument("--ttt-steps", type=int, default=10, help="TTT optimization steps")
+    parser.add_argument("--ttt-steps", type=int, default=50, help="TTT optimization steps")
     parser.add_argument("--ttt-lr", type=float, default=0.05, help="TTT learning rate")
     parser.add_argument("--num-aug", type=int, default=8, help="Number of D8 augmentations")
     parser.add_argument("--no-ttt", action="store_true", help="Disable TTT")
-    parser.add_argument("--color-perm", action="store_true", help="Enable color permutation TTA")
+    parser.add_argument("--no-color-perm", action="store_true", help="Disable color permutation TTA (enabled by default)")
     parser.add_argument("--num-color-perms", type=int, default=10, help="Number of color permutations")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
+    parser.add_argument("--save-viz", type=str, default=None, help="Path to save PDF visualization")
 
     args = parser.parse_args()
 
     # Load model
     print(f"Loading checkpoint: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=args.device)
+    checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
 
     # Extract config from checkpoint
     config = checkpoint.get('config', {})
@@ -582,9 +774,10 @@ if __name__ == "__main__":
         ttt_lr=args.ttt_lr,
         num_aug=args.num_aug,
         enable_ttt=not args.no_ttt,
-        enable_color_perm=args.color_perm,
+        enable_color_perm=not args.no_color_perm,
         num_color_perms=args.num_color_perms,
-        verbose=True
+        verbose=True,
+        viz_path=args.save_viz
     )
 
     # Save submission

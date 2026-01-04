@@ -118,11 +118,11 @@ class SpatialEncoder(nn.Module):
         x = x + pos.unsqueeze(0)
 
         # Flatten to tokens [B, H*W, D]
-        z_C = x.view(B, H * W, self.d_model)
+        z_C = x.reshape(B, H * W, self.d_model)
 
         if valid_mask is not None:
             # Mask invalid pixels (padding)
-            mask_flat = valid_mask.view(B, H * W, 1)
+            mask_flat = valid_mask.reshape(B, H * W, 1)
             z_C = z_C * mask_flat
 
         return z_C
@@ -378,7 +378,7 @@ class TOPASDSPLModel(nn.Module):
 
         # Flatten valid mask for CanvasCore
         # [B, 1, H, W] -> [B, H*W, 1]
-        valid_mask_flat = valid_mask_2d.view(B, 1, -1).permute(0, 2, 1)
+        valid_mask_flat = valid_mask_2d.reshape(B, 1, -1).permute(0, 2, 1)
 
         # 2. Recursive Loop
         # Structure: H cycles -> L cycles
@@ -438,7 +438,7 @@ class TOPASDSPLModel(nn.Module):
 
                 # Convert to grid output
                 pixels = self.to_pixels(z_C)  # [B, H*W, C]
-                pixels = pixels.view(B, H, W, self.num_colors)
+                pixels = pixels.reshape(B, H, W, self.num_colors)
                 pixels = pixels.permute(0, 3, 1, 2)  # [B, C, H, W]
                 outputs.append(pixels)
 
