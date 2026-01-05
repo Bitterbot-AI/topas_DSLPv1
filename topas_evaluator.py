@@ -519,7 +519,11 @@ def evaluate_arc_submission(
                     status = "SOLVED" if is_correct else "Failed"
                     icon = "+" if is_correct else "-"
                     acc_pct = (correct / total * 100) if total > 0 else 0.0
-                    print(f"  [{icon}] {task_id}[{test_idx}]: {status} | ACC: {correct}/{total} ({acc_pct:.1f}%)")
+                    # Pixel accuracy (crop pred to expected size)
+                    eh, ew = expected.shape
+                    pred_crop = preds[0][:eh, :ew] if preds[0].shape[0] >= eh and preds[0].shape[1] >= ew else preds[0]
+                    pixel_acc = (pred_crop == expected).sum() / expected.size * 100
+                    print(f"  [{icon}] {task_id}[{test_idx}]: {status} | ACC: {correct}/{total} ({acc_pct:.1f}%) | Pix: {pixel_acc:.1f}%", flush=True)
 
                 # Collect visualization data
                 if viz_data is not None:
@@ -598,6 +602,10 @@ def _generate_eval_pdf(viz_data: List[Dict], output_path: str, correct: int, tot
                 target = data['target']
                 test_input = data['test_input']
 
+                # Ensure pred and target have same shape (crop pred to target size)
+                th, tw = target.shape
+                pred_cropped = pred[:th, :tw] if pred.shape[0] >= th and pred.shape[1] >= tw else pred
+
                 # Demo 1 (first demo pair)
                 if len(data['demos_in']) > 0:
                     plot_grid(axes[row, 0], data['demos_in'][0], "Demo In")
@@ -609,17 +617,17 @@ def _generate_eval_pdf(viz_data: List[Dict], output_path: str, correct: int, tot
                 # Test input
                 plot_grid(axes[row, 2], test_input, "Test Input")
 
-                # Prediction with status
+                # Prediction with status (show cropped version)
                 status = "CORRECT" if data['is_correct'] else "WRONG"
                 color = 'green' if data['is_correct'] else 'red'
-                plot_grid(axes[row, 3], pred, f"Pred ({status})")
+                plot_grid(axes[row, 3], pred_cropped, f"Pred ({status})")
                 axes[row, 3].title.set_color(color)
 
                 # Target
                 plot_grid(axes[row, 4], target, "Target")
 
-                # Error map
-                error_map = create_error_map(pred, target, pad_class=10)
+                # Error map (use cropped pred)
+                error_map = create_error_map(pred_cropped, target, pad_class=10)
                 plot_error_map(axes[row, 5], error_map, "Error Map")
 
                 # Add task ID as row label
@@ -660,7 +668,12 @@ def _generate_eval_pdf(viz_data: List[Dict], output_path: str, correct: int, tot
         total_missed = 0
         total_false_pos = 0
         for data in viz_data:
-            error_map = create_error_map(data['prediction'], data['target'], pad_class=10)
+            pred = data['prediction']
+            target = data['target']
+            # Crop pred to target size
+            th, tw = target.shape
+            pred_cropped = pred[:th, :tw] if pred.shape[0] >= th and pred.shape[1] >= tw else pred
+            error_map = create_error_map(pred_cropped, target, pad_class=10)
             total_wrong_color += (error_map == 1).sum()
             total_missed += (error_map == 2).sum()
             total_false_pos += (error_map == 3).sum()
