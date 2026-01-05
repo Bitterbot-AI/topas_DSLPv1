@@ -519,10 +519,13 @@ def evaluate_arc_submission(
                     status = "SOLVED" if is_correct else "Failed"
                     icon = "+" if is_correct else "-"
                     acc_pct = (correct / total * 100) if total > 0 else 0.0
-                    # Pixel accuracy (crop pred to expected size)
+                    # Pixel accuracy (compare overlapping region only)
+                    ph, pw = preds[0].shape
                     eh, ew = expected.shape
-                    pred_crop = preds[0][:eh, :ew] if preds[0].shape[0] >= eh and preds[0].shape[1] >= ew else preds[0]
-                    pixel_acc = (pred_crop == expected).sum() / expected.size * 100
+                    min_h, min_w = min(ph, eh), min(pw, ew)
+                    pred_crop = preds[0][:min_h, :min_w]
+                    exp_crop = expected[:min_h, :min_w]
+                    pixel_acc = (pred_crop == exp_crop).sum() / exp_crop.size * 100 if exp_crop.size > 0 else 0.0
                     print(f"  [{icon}] {task_id}[{test_idx}]: {status} | ACC: {correct}/{total} ({acc_pct:.1f}%) | Pix: {pixel_acc:.1f}%", flush=True)
 
                 # Collect visualization data
@@ -602,9 +605,12 @@ def _generate_eval_pdf(viz_data: List[Dict], output_path: str, correct: int, tot
                 target = data['target']
                 test_input = data['test_input']
 
-                # Ensure pred and target have same shape (crop pred to target size)
+                # Ensure pred and target have same shape (crop both to overlapping region)
+                ph, pw = pred.shape
                 th, tw = target.shape
-                pred_cropped = pred[:th, :tw] if pred.shape[0] >= th and pred.shape[1] >= tw else pred
+                min_h, min_w = min(ph, th), min(pw, tw)
+                pred_cropped = pred[:min_h, :min_w]
+                target = target[:min_h, :min_w]
 
                 # Demo 1 (first demo pair)
                 if len(data['demos_in']) > 0:
@@ -670,10 +676,13 @@ def _generate_eval_pdf(viz_data: List[Dict], output_path: str, correct: int, tot
         for data in viz_data:
             pred = data['prediction']
             target = data['target']
-            # Crop pred to target size
+            # Crop both to overlapping region
+            ph, pw = pred.shape
             th, tw = target.shape
-            pred_cropped = pred[:th, :tw] if pred.shape[0] >= th and pred.shape[1] >= tw else pred
-            error_map = create_error_map(pred_cropped, target, pad_class=10)
+            min_h, min_w = min(ph, th), min(pw, tw)
+            pred_cropped = pred[:min_h, :min_w]
+            target_cropped = target[:min_h, :min_w]
+            error_map = create_error_map(pred_cropped, target_cropped, pad_class=10)
             total_wrong_color += (error_map == 1).sum()
             total_missed += (error_map == 2).sum()
             total_false_pos += (error_map == 3).sum()
