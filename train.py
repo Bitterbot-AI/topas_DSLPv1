@@ -41,6 +41,7 @@ _parent_for_muon = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _parent_for_muon not in sys.path:
     sys.path.append(_parent_for_muon)
 from muonclip import MuonClip, MuonClipConfig
+from sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 
 
 def cosine_schedule_with_warmup(
@@ -1026,6 +1027,7 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
         L_layers=model_cfg.get("L_layers", 2),
         puzzle_emb_ndim=puzzle_emb_ndim,
         num_tasks=num_total_tasks,
+        batch_size=batch_size,  # For CastedSparseEmbedding
         halt_max_steps=model_cfg.get("halt_max_steps", 16),
         halt_exploration_prob=model_cfg.get("halt_exploration_prob", 0.1),
     ).to(device)
@@ -1063,19 +1065,52 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
     logger.info(f"Gradient accumulation: {accumulation_steps} steps")
     logger.info(f"LR warmup: {lr_warmup_steps} steps, min_ratio: {lr_min_ratio}")
 
-    # Optimizer setup
+    # Optimizer setup - Dual optimizer for TRM Turbo
     optimizers = []
     optimizer_lrs = []
 
     if freeze_weights:
         raise ValueError("freeze_weights=True is not supported (puzzle embeddings disabled)")
     else:
-        # AdamW + MuonClip for main model (proven stable)
-        base_optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
-        main_optimizer = MuonClip(base_optimizer, model, MuonClipConfig())
-        optimizers.append(main_optimizer)
-        optimizer_lrs.append(lr)
-        logger.info(f"Using AdamW + MuonClip for main model: base_lr={lr}, wd={wd}")
+        # Check if puzzle embedding uses CastedSparseEmbedding
+        has_sparse_emb = (raw_model.puzzle_emb is not None and
+                         hasattr(raw_model.puzzle_emb, 'local_weights'))
+
+        if has_sparse_emb:
+            # TRM Turbo: Dual optimizer setup
+            # 1. Get embedding module for SignSGD
+            emb_module = raw_model.puzzle_emb
+
+            # 2. Get network params (exclude puzzle_emb)
+            net_params = [p for n, p in raw_model.named_parameters()
+                         if "puzzle_emb" not in n]
+
+            # 3. SignSGD optimizer for memory embeddings (HIGH LR for instant memorization)
+            emb_lr = reg_cfg.get("puzzle_emb_lr", 0.01)  # TRM uses high LR for memory
+            emb_wd = reg_cfg.get("puzzle_emb_wd", 0.01)
+            emb_optimizer = CastedSparseEmbeddingSignSGD_Distributed(
+                [emb_module],  # Pass embedding module directly
+                world_size=world_size,
+                lr=emb_lr,
+                weight_decay=emb_wd,
+            )
+            optimizers.append(emb_optimizer)
+            optimizer_lrs.append(emb_lr)
+            logger.info(f"Using SignSGD for puzzle embeddings: lr={emb_lr}, wd={emb_wd}")
+
+            # 4. AdamW + MuonClip for network (excluding embeddings)
+            base_optimizer = optim.AdamW(net_params, lr=lr, weight_decay=wd)
+            main_optimizer = MuonClip(base_optimizer, model, MuonClipConfig())
+            optimizers.append(main_optimizer)
+            optimizer_lrs.append(lr)
+            logger.info(f"Using AdamW + MuonClip for network: base_lr={lr}, wd={wd}")
+        else:
+            # Standard: Single optimizer for all parameters
+            base_optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+            main_optimizer = MuonClip(base_optimizer, model, MuonClipConfig())
+            optimizers.append(main_optimizer)
+            optimizer_lrs.append(lr)
+            logger.info(f"Using AdamW + MuonClip for main model: base_lr={lr}, wd={wd}")
 
     # Primary optimizer reference (for checkpoint - use main optimizer, not SignSGD)
     # MuonClip is added last, so use the last optimizer
@@ -1137,6 +1172,7 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
             L_layers=model_cfg.get("L_layers", 2),
             puzzle_emb_ndim=puzzle_emb_ndim,
             num_tasks=num_total_tasks,
+            batch_size=batch_size,  # For CastedSparseEmbedding
             halt_max_steps=model_cfg.get("halt_max_steps", 16),
             halt_exploration_prob=0.0,  # No exploration for EMA model
         ).to(device)
@@ -1516,11 +1552,17 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
                     for opt in optimizers:
                         xm.optimizer_step(opt)
                 elif use_amp:
+                    # Only unscale/scale PyTorch optimizers (not custom embedding optimizer)
                     for opt in optimizers:
-                        scaler.unscale_(opt)
+                        if hasattr(opt, '_is_pytorch_optimizer') or isinstance(opt, torch.optim.Optimizer) or hasattr(opt, 'base_optimizer'):
+                            scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     for opt in optimizers:
-                        scaler.step(opt)
+                        if hasattr(opt, '_is_pytorch_optimizer') or isinstance(opt, torch.optim.Optimizer) or hasattr(opt, 'base_optimizer'):
+                            scaler.step(opt)
+                        else:
+                            # Custom optimizer (e.g., CastedSparseEmbeddingSignSGD_Distributed)
+                            opt.step()
                     scaler.update()
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)

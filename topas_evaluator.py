@@ -3,8 +3,10 @@ TOPAS Evaluator: Test-Time Training + Augmentation for ARC-AGI
 
 Features:
 1. TTT (Test-Time Training): Optimizes program tokens on demos via Leave-One-Out CV
-2. TTA (Test-Time Augmentation): Full D8 dihedral + optional color permutations
-3. Majority Voting: Robust ensemble prediction with top-k candidates
+2. TTA (Test-Time Augmentation):
+   - TRM-Style (num_aug > 100): Random sampling of Translation + Dihedral + Color
+   - Systematic (num_aug <= 100): Full D8 dihedral + optional color permutations
+3. Majority Voting: Robust ensemble prediction with top-k candidates (count-first)
 
 Compatible with TOPASDSPLModel from topas_dslp_model.py
 """
@@ -16,7 +18,7 @@ import math
 import os
 import random
 from collections import Counter
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Generator
 
 import numpy as np
 import torch
@@ -40,6 +42,43 @@ except ImportError:
 ARC_GRID_SIZE = 30
 NUM_COLORS = 11  # 0-9 + PAD (index 10)
 PAD_CLASS = 10
+
+# Crop function - find bounding box of non-PAD content
+def _crop_to_content(grid: np.ndarray) -> np.ndarray:
+    """
+    Crop grid to content region, assuming content starts at (0,0).
+
+    This matches how training data is structured:
+    - Content is placed at top-left (0,0)
+    - Find first row/column that is ALL PAD to determine boundary
+
+    For TOPAS: valid tokens are 0-9 (colors), PAD is 10.
+    """
+    grid = grid.reshape(30, 30)
+
+    # Find content dimensions by scanning from top-left
+    # Same approach as puzzle_dataset.py _seq_to_grid
+    content_mask = (grid >= 0) & (grid <= 9)  # Non-PAD pixels
+
+    # Find height: first row that has no content
+    H = 30
+    for h in range(30):
+        if not content_mask[h, :].any():
+            H = h
+            break
+
+    # Find width: first column that has no content
+    W = 30
+    for w in range(30):
+        if not content_mask[:, w].any():
+            W = w
+            break
+
+    if H == 0 or W == 0:
+        # No valid content
+        return np.array([[0]], dtype=np.uint8)
+
+    return grid[:H, :W].astype(np.uint8)
 
 
 class TOPASEvaluator:
@@ -81,19 +120,22 @@ class TOPASEvaluator:
         """
         Solve a single puzzle with TTT + TTA.
 
+        If num_aug > 100: Uses TRM-style random sampling (Translation + Dihedral + Color)
+        If num_aug <= 100: Uses systematic D8 + color permutations
+
         Args:
             puzzle_data: dict with 'train' (list of {'input': grid, 'output': grid})
                         and 'test' (list of {'input': grid})
             ttt_steps: Number of gradient steps for TTT optimization
             ttt_lr: Learning rate for TTT
-            num_aug: Number of D8 augmentations (max 8)
+            num_aug: Number of augmentations (>100 triggers TRM random sampling)
             enable_ttt: Whether to run TTT before inference
             enable_color_perm: Whether to include color permutations in TTA
             num_color_perms: Number of random color permutations to try
             top_k: Return top-k candidates by vote count
 
         Returns:
-            List of top-k predicted grids as numpy arrays
+            List of top-k predicted grids as numpy arrays (cropped)
         """
         # 1. Prepare Data
         train_pairs = puzzle_data['train']
@@ -112,26 +154,64 @@ class TOPASEvaluator:
                 print(f"  > Running TTT for {ttt_steps} steps...")
             self._run_ttt(demos_in, demos_out, steps=ttt_steps, lr=ttt_lr)
 
-        # 3. Test-Time Augmentation
-        votes = Counter()
-        grid_cache = {}  # hash -> grid
+        # 3. Test-Time Augmentation with TRM-style Majority Voting
+        votes = {}  # hash -> {'count': int, 'conf_sum': float, 'grid': np.array}
 
-        # Generate augmentations
-        augmentations = self._generate_augmentations(num_aug, enable_color_perm, num_color_perms)
+        # Determine strategy: TRM random sampling vs systematic
+        use_random_sampling = (num_aug > 100)
+
+        if use_random_sampling:
+            # TRM-Style: Random sampling of Translation + Dihedral + Color
+            augmentations = self._generate_random_augmentations(num_aug, enable_color_perm)
+        else:
+            # Systematic: D8 + Color permutations
+            augmentations = self._generate_systematic_augmentations(num_aug, enable_color_perm, num_color_perms)
 
         with torch.no_grad():
-            for aug_fn, inv_aug_fn, color_map in augmentations:
+            for aug_data in augmentations:
                 try:
-                    # Apply consistent augmentation to demos AND test
-                    aug_demos_in = aug_fn(demos_in)
-                    aug_demos_out = aug_fn(demos_out)
-                    aug_test_in = aug_fn(test_in.unsqueeze(0)).squeeze(0)
+                    if use_random_sampling:
+                        # Random sampling mode: aug_data = (aug_fn, inv_aug_fn, color_map, use_translation)
+                        aug_fn, inv_aug_fn, color_map, use_translation = aug_data
 
-                    # Apply color permutation if provided
-                    if color_map is not None:
-                        aug_demos_in = self._apply_color_perm(aug_demos_in, color_map)
-                        aug_demos_out = self._apply_color_perm(aug_demos_out, color_map)
-                        aug_test_in = self._apply_color_perm(aug_test_in.unsqueeze(0), color_map).squeeze(0)
+                        # Apply dihedral + color to demos
+                        aug_demos_in = aug_fn(demos_in)
+                        aug_demos_out = aug_fn(demos_out)
+                        if color_map is not None:
+                            aug_demos_in = self._apply_color_perm(aug_demos_in, color_map)
+                            aug_demos_out = self._apply_color_perm(aug_demos_out, color_map)
+
+                        # Apply dihedral + color to test input
+                        aug_test_in = aug_fn(test_in.unsqueeze(0)).squeeze(0)
+                        if color_map is not None:
+                            aug_test_in = self._apply_color_perm(aug_test_in.unsqueeze(0), color_map).squeeze(0)
+
+                        # Only apply translation if enabled (TRM-style TTA doesn't use translation)
+                        if use_translation:
+                            # Translate demos CONSISTENTLY (Input & Output move together)
+                            aug_demos_in, aug_demos_out, _ = self._apply_consistent_translation(
+                                aug_demos_in, aug_demos_out
+                            )
+                            # Translate test input
+                            aug_test_batch, _, test_shifts = self._apply_consistent_translation(
+                                aug_test_in.unsqueeze(0), None
+                            )
+                            aug_test_in = aug_test_batch.squeeze(0)
+                    else:
+                        # Systematic mode: aug_data = (aug_fn, inv_aug_fn, color_map)
+                        aug_fn, inv_aug_fn, color_map = aug_data
+                        test_shift = (0, 0)
+
+                        # Apply consistent augmentation to demos AND test
+                        aug_demos_in = aug_fn(demos_in)
+                        aug_demos_out = aug_fn(demos_out)
+                        aug_test_in = aug_fn(test_in.unsqueeze(0)).squeeze(0)
+
+                        # Apply color permutation if provided
+                        if color_map is not None:
+                            aug_demos_in = self._apply_color_perm(aug_demos_in, color_map)
+                            aug_demos_out = self._apply_color_perm(aug_demos_out, color_map)
+                            aug_test_in = self._apply_color_perm(aug_test_in.unsqueeze(0), color_map).squeeze(0)
 
                     # Format for model: [1, n_demos, C, H, W]
                     batch_demos_in = aug_demos_in.unsqueeze(0).to(self.device)
@@ -152,30 +232,37 @@ class TOPASEvaluator:
                     # Get prediction
                     pred_grid = logits.argmax(dim=1)  # [1, H, W]
 
-                    # Calculate confidence score (mean probability of predicted pixels)
+                    # Calculate confidence score
                     probs = F.softmax(logits, dim=1)  # [1, C, H, W]
                     pred_probs = probs.gather(1, pred_grid.unsqueeze(1))  # [1, 1, H, W]
-                    confidence = pred_probs[:, :, :test_h, :test_w].mean().item()
+                    confidence = pred_probs.mean().item()
 
-                    # Inverse color permutation
+                    # Inverse transforms (reverse order)
+                    # NOTE: We do NOT inverse-translate predictions.
+                    # Translation changes absolute position but the model's output position
+                    # depends on the TASK, not our artificial shift. Just crop and vote.
+
+                    # 1. Inverse color permutation
                     if color_map is not None:
                         inv_color_map = {v: k for k, v in color_map.items()}
                         pred_grid = self._apply_color_perm_indices(pred_grid, inv_color_map)
 
-                    # Inverse spatial transform
+                    # 3. Inverse spatial (dihedral) transform
                     pred_orig = inv_aug_fn(pred_grid.float()).long()
 
-                    # Crop to original size and convert to numpy
-                    pred_np = pred_orig[0, :test_h, :test_w].cpu().numpy().astype(int)
+                    # Get full 30x30 grid (DO NOT CROP - match trainer approach)
+                    pred_np = pred_orig[0].cpu().numpy().astype(int)
+                    pred_np = np.clip(pred_np, 0, 10)
 
-                    # Handle any remaining PAD tokens (map to background, not random color)
-                    pred_np[pred_np >= 10] = 0  # PAD → Background
-                    pred_np = np.clip(pred_np, 0, 9)
-
-                    # Vote (confidence-weighted)
+                    # Vote on FULL 30x30 grids (like trainer does)
+                    # This is more robust than cropping because:
+                    # 1. Different augmentations may produce slightly different positions
+                    # 2. Masked comparison handles this correctly
                     grid_hash = self._hash_grid(pred_np)
-                    votes[grid_hash] += confidence
-                    grid_cache[grid_hash] = pred_np
+                    if grid_hash not in votes:
+                        votes[grid_hash] = {'count': 0, 'conf_sum': 0.0, 'grid': pred_np}
+                    votes[grid_hash]['count'] += 1
+                    votes[grid_hash]['conf_sum'] += confidence
 
                 except Exception as e:
                     if self.verbose:
@@ -185,18 +272,31 @@ class TOPASEvaluator:
         # 4. Restore original model state
         self.model.program_token_init.data = self._original_program_tokens.clone()
 
-        # 5. Return top-k results
+        # 5. Return top-k results (count-first sorting)
         if not votes:
-            # Fallback: return empty grid
-            return [np.zeros((test_h, test_w), dtype=int)]
+            return [np.array([[0]], dtype=np.uint8)]
 
-        top_hashes = [h for h, _ in votes.most_common(top_k)]
-        results = [grid_cache[h] for h in top_hashes]
+        candidates = sorted(
+            votes.values(),
+            key=lambda x: (x['count'], x['conf_sum'] / x['count'] if x['count'] > 0 else 0),
+            reverse=True
+        )
 
         if self.verbose:
-            top_conf = votes.most_common(1)[0][1]
-            total_conf = sum(votes.values())
-            print(f"  > Top vote: {top_conf:.3f}/{total_conf:.3f} confidence ({len(votes)} unique predictions)")
+            top = candidates[0]
+            total_votes = sum(v['count'] for v in votes.values())
+            mean_conf = top['conf_sum'] / top['count'] if top['count'] > 0 else 0
+            print(f"  > Top vote: {top['count']}/{total_votes} votes, {mean_conf:.3f} mean conf ({len(votes)} unique)")
+
+        # Crop ONLY when returning final results (for ARC submission format)
+        # Voting was done on full 30x30 grids for robustness
+        results = []
+        for c in candidates[:top_k]:
+            full_grid = c['grid']
+            cropped = _crop_to_content(full_grid)
+            if cropped.size == 0:
+                cropped = np.array([[0]], dtype=np.uint8)
+            results.append(cropped)
 
         return results
 
@@ -218,7 +318,8 @@ class TOPASEvaluator:
 
         # Create optimizable parameter
         param = nn.Parameter(self.model.program_token_init.data.clone())
-        optimizer = optim.Adam([param], lr=lr)
+        # SGD + Momentum for stability on few-shot TTT (Gemini recommendation)
+        optimizer = optim.SGD([param], lr=lr, momentum=0.9)
 
         # Temporarily replace model's program tokens
         original_param = self.model.program_token_init
@@ -278,87 +379,276 @@ class TOPASEvaluator:
         self.model.eval()
         # Note: param is still in model.program_token_init, will be restored in solve_puzzle
 
-    def _generate_augmentations(
+    def _generate_random_augmentations(
+        self,
+        n_samples: int,
+        enable_color_perm: bool
+    ) -> Generator:
+        """
+        TRM-Style: Generate n_samples of RANDOM (Dihedral + Color).
+        NO translation at inference - TRM only uses translation for training data augmentation.
+
+        Yields: (aug_fn, inv_aug_fn, color_map, use_translation=False)
+        """
+        for _ in range(n_samples):
+            # 1. Random Dihedral (0-7) - TRM encoding
+            k = random.randint(0, 7)
+            aug_fn, inv_aug_fn = self._get_dihedral_fns(k)
+
+            # 2. Random Color permutation - TRM style: keep 0 (background) fixed
+            color_map = None
+            if enable_color_perm:
+                # Permute colors 1-9, keep 0 fixed (TRM style)
+                perm = [0] + list(np.random.permutation(range(1, 10)))
+                color_map = {i: perm[i] for i in range(10)}
+                color_map[PAD_CLASS] = PAD_CLASS
+
+            # NO translation at inference (False flag)
+            yield aug_fn, inv_aug_fn, color_map, False
+
+    def _generate_systematic_augmentations(
         self,
         num_dihedral: int = 8,
         enable_color_perm: bool = False,
         num_color_perms: int = 10
     ) -> List[Tuple]:
         """
-        Generate augmentation functions.
+        Systematic: Full D8 + optional color permutations.
+        TRM-style: keep color 0 (background) fixed.
 
         Returns list of (aug_fn, inv_aug_fn, color_map) tuples.
-        aug_fn/inv_aug_fn work on [N, C, H, W] or [C, H, W] tensors.
         """
         augmentations = []
 
-        # D8 Dihedral group: 4 rotations x 2 (with/without flip)
+        # D8 Dihedral group (TRM encoding)
         for k in range(min(num_dihedral, 8)):
-            rot = k % 4  # 0, 1, 2, 3 = 0, 90, 180, 270 degrees
-            flip = k >= 4  # Whether to flip horizontally
-
-            def make_aug(rot, flip):
-                def aug_fn(x):
-                    # x: [N, C, H, W] or [C, H, W]
-                    if x.dim() == 3:
-                        x = x.unsqueeze(0)
-                        squeeze = True
-                    else:
-                        squeeze = False
-
-                    if flip:
-                        x = torch.flip(x, dims=[3])  # Horizontal flip
-                    if rot > 0:
-                        x = torch.rot90(x, k=rot, dims=[2, 3])
-
-                    return x.squeeze(0) if squeeze else x
-
-                def inv_aug_fn(x):
-                    # x: [N, H, W] (class indices) or [N, C, H, W]
-                    has_channel = x.dim() == 4
-
-                    if x.dim() == 2:
-                        x = x.unsqueeze(0)
-                        squeeze = True
-                    else:
-                        squeeze = False
-
-                    if has_channel:
-                        dims_hw = [2, 3]
-                        flip_dim = 3
-                    else:
-                        dims_hw = [1, 2]
-                        flip_dim = 2
-
-                    # Inverse: undo rotation first, then flip
-                    if rot > 0:
-                        x = torch.rot90(x, k=-rot, dims=dims_hw)
-                    if flip:
-                        x = torch.flip(x, dims=[flip_dim])
-
-                    return x.squeeze(0) if squeeze else x
-
-                return aug_fn, inv_aug_fn
-
-            aug_fn, inv_aug_fn = make_aug(rot, flip)
+            aug_fn, inv_aug_fn = self._get_dihedral_fns(k)
             augmentations.append((aug_fn, inv_aug_fn, None))
 
-        # Color permutations (optional)
+        # Color permutations (optional) - TRM style: keep 0 fixed
         if enable_color_perm and num_color_perms > 0:
             base_augs = augmentations.copy()
 
             for _ in range(num_color_perms):
-                # Random permutation of colors 0-9 (not PAD)
-                perm = list(range(10))
-                random.shuffle(perm)
+                # Permute colors 1-9, keep 0 fixed (TRM style)
+                perm = [0] + list(np.random.permutation(range(1, 10)))
                 color_map = {i: perm[i] for i in range(10)}
-                color_map[PAD_CLASS] = PAD_CLASS  # Keep PAD unchanged
+                color_map[PAD_CLASS] = PAD_CLASS
 
-                # Combine with each dihedral augmentation
                 for aug_fn, inv_aug_fn, _ in base_augs:
                     augmentations.append((aug_fn, inv_aug_fn, color_map))
 
         return augmentations
+
+    # TRM D8 inverse mapping
+    DIHEDRAL_INVERSE = [0, 3, 2, 1, 4, 5, 6, 7]
+
+    def _get_dihedral_fns(self, k: int) -> Tuple:
+        """
+        Get aug/inv functions for D8 transform k (0-7).
+
+        TRM encoding (must match training data augmentation):
+        - 0: identity
+        - 1: rot90
+        - 2: rot180
+        - 3: rot270
+        - 4: flipLR (horizontal flip)
+        - 5: flipUD (vertical flip)
+        - 6: transpose
+        - 7: flipLR(rot90)
+        """
+        def aug_fn(x):
+            if x.dim() == 3:
+                x = x.unsqueeze(0)
+                squeeze = True
+            else:
+                squeeze = False
+
+            # Apply TRM-style dihedral transform
+            if k == 0:
+                pass  # identity
+            elif k == 1:
+                x = torch.rot90(x, k=1, dims=[2, 3])
+            elif k == 2:
+                x = torch.rot90(x, k=2, dims=[2, 3])
+            elif k == 3:
+                x = torch.rot90(x, k=3, dims=[2, 3])
+            elif k == 4:
+                x = torch.flip(x, dims=[3])  # flipLR
+            elif k == 5:
+                x = torch.flip(x, dims=[2])  # flipUD
+            elif k == 6:
+                x = x.transpose(2, 3)  # transpose
+            elif k == 7:
+                x = torch.flip(torch.rot90(x, k=1, dims=[2, 3]), dims=[3])  # flipLR(rot90)
+
+            return x.squeeze(0) if squeeze else x
+
+        def inv_aug_fn(x):
+            has_channel = x.dim() == 4
+
+            if x.dim() == 2:
+                x = x.unsqueeze(0)
+                squeeze = True
+            else:
+                squeeze = False
+
+            if has_channel:
+                dims_hw = [2, 3]
+                flip_lr = 3
+                flip_ud = 2
+            else:
+                dims_hw = [1, 2]
+                flip_lr = 2
+                flip_ud = 1
+
+            # Apply inverse transform using TRM's inverse mapping
+            inv_k = self.DIHEDRAL_INVERSE[k]
+            if inv_k == 0:
+                pass  # identity
+            elif inv_k == 1:
+                x = torch.rot90(x, k=1, dims=dims_hw)
+            elif inv_k == 2:
+                x = torch.rot90(x, k=2, dims=dims_hw)
+            elif inv_k == 3:
+                x = torch.rot90(x, k=3, dims=dims_hw)
+            elif inv_k == 4:
+                x = torch.flip(x, dims=[flip_lr])  # flipLR
+            elif inv_k == 5:
+                x = torch.flip(x, dims=[flip_ud])  # flipUD
+            elif inv_k == 6:
+                x = x.transpose(dims_hw[0], dims_hw[1])  # transpose
+            elif inv_k == 7:
+                x = torch.flip(torch.rot90(x, k=1, dims=dims_hw), dims=[flip_lr])
+
+            return x.squeeze(0) if squeeze else x
+
+        return aug_fn, inv_aug_fn
+
+    def _apply_consistent_translation(
+        self,
+        inputs: torch.Tensor,
+        outputs: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[Tuple[int, int]]]:
+        """
+        TRUE translation: shift entire grids by (dr, dc), preserving spatial relationships.
+
+        Unlike extract-reposition, this maintains relative positions between input/output.
+        E.g., if output was 2 pixels right of input, it stays 2 pixels right after shift.
+        """
+        N, C, H, W = inputs.shape
+        shifts = []
+
+        # Find combined bounding box across ALL inputs and outputs
+        # to compute a valid shift range
+        for i in range(N):
+            # Get input content bounds
+            rows_i, cols_i = torch.where(inputs[i, PAD_CLASS, :, :] < 0.5)
+            if len(rows_i) == 0:
+                min_r_i, max_r_i, min_c_i, max_c_i = 0, 0, 0, 0
+            else:
+                min_r_i, max_r_i = rows_i.min().item(), rows_i.max().item()
+                min_c_i, max_c_i = cols_i.min().item(), cols_i.max().item()
+
+            # Get output content bounds (if exists)
+            if outputs is not None:
+                rows_o, cols_o = torch.where(outputs[i, PAD_CLASS, :, :] < 0.5)
+                if len(rows_o) > 0:
+                    min_r_o, max_r_o = rows_o.min().item(), rows_o.max().item()
+                    min_c_o, max_c_o = cols_o.min().item(), cols_o.max().item()
+                else:
+                    min_r_o, max_r_o, min_c_o, max_c_o = min_r_i, max_r_i, min_c_i, max_c_i
+            else:
+                min_r_o, max_r_o, min_c_o, max_c_o = min_r_i, max_r_i, min_c_i, max_c_i
+
+            # Combined bounding box (union of input and output)
+            union_min_r = min(min_r_i, min_r_o)
+            union_max_r = max(max_r_i, max_r_o)
+            union_min_c = min(min_c_i, min_c_o)
+            union_max_c = max(max_c_i, max_c_o)
+
+            # Valid shift range: shift must keep union bbox within [0, H) x [0, W)
+            # After shift by (dr, dc): new_min_r = union_min_r + dr, new_max_r = union_max_r + dr
+            # Constraints: new_min_r >= 0, new_max_r < H
+            # => dr >= -union_min_r, dr <= H - 1 - union_max_r
+            dr_min = -union_min_r
+            dr_max = H - 1 - union_max_r
+            dc_min = -union_min_c
+            dc_max = W - 1 - union_max_c
+
+            # Sample random shift
+            if dr_max >= dr_min:
+                dr = random.randint(dr_min, dr_max)
+            else:
+                dr = 0
+            if dc_max >= dc_min:
+                dc = random.randint(dc_min, dc_max)
+            else:
+                dc = 0
+            shifts.append((dr, dc))
+
+        # Apply shifts using torch.roll (true translation with wrap, then mask)
+        out_in = torch.zeros_like(inputs)
+        out_in[:, PAD_CLASS, :, :] = 1.0
+        out_out = None
+        if outputs is not None:
+            out_out = torch.zeros_like(outputs)
+            out_out[:, PAD_CLASS, :, :] = 1.0
+
+        for i, (dr, dc) in enumerate(shifts):
+            if dr == 0 and dc == 0:
+                out_in[i] = inputs[i]
+                if outputs is not None:
+                    out_out[i] = outputs[i]
+                continue
+
+            # Shift input: content at (r, c) moves to (r+dr, c+dc)
+            # Use slicing to avoid wrap-around issues
+            src_r = slice(max(0, -dr), min(H, H - dr))
+            src_c = slice(max(0, -dc), min(W, W - dc))
+            dst_r = slice(max(0, dr), min(H, H + dr))
+            dst_c = slice(max(0, dc), min(W, W + dc))
+
+            out_in[i, :, dst_r, dst_c] = inputs[i, :, src_r, src_c]
+
+            if outputs is not None:
+                out_out[i, :, dst_r, dst_c] = outputs[i, :, src_r, src_c]
+
+        return out_in, out_out, shifts
+
+    def _inverse_translation(
+        self,
+        pred: torch.Tensor,
+        shift: Tuple[int, int]
+    ) -> torch.Tensor:
+        """
+        Inverse shift prediction by (-dr, -dc).
+
+        pred: [1, 30, 30] class indices
+        shift: (dr, dc) applied to input
+
+        Logic: If input was shifted +dr, output is likely shifted +dr.
+        We want output at origin (aligned), so: Sol[y,x] = Pred[y+dr, x+dc]
+        """
+        dr, dc = shift
+        if dr == 0 and dc == 0:
+            return pred
+
+        H, W = 30, 30
+        out = torch.full_like(pred, PAD_CLASS)
+
+        # Safe slicing: copy from shifted region to origin
+        src_r_start, src_r_end = dr, H
+        src_c_start, src_c_end = dc, W
+
+        dst_r_start, dst_r_end = 0, H - dr
+        dst_c_start, dst_c_end = 0, W - dc
+
+        if src_r_end > src_r_start and src_c_end > src_c_start:
+            out[:, dst_r_start:dst_r_end, dst_c_start:dst_c_end] = \
+                pred[:, src_r_start:src_r_end, src_c_start:src_c_end]
+
+        return out
 
     def _apply_color_perm(self, x: torch.Tensor, color_map: Dict[int, int]) -> torch.Tensor:
         """
@@ -435,7 +725,8 @@ def evaluate_arc_submission(
     enable_color_perm: bool = False,
     num_color_perms: int = 10,
     verbose: bool = True,
-    viz_path: Optional[str] = None
+    viz_path: Optional[str] = None,
+    log_path: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Evaluate model on ARC challenge set with TTT + TTA.
@@ -452,6 +743,7 @@ def evaluate_arc_submission(
         num_color_perms: Number of color permutations
         verbose: Print progress
         viz_path: Optional path to save PDF visualization
+        log_path: Optional path to save text log with pre/post TTT comparison
 
     Returns:
         Dict with 'predictions' and optionally 'accuracy' metrics
@@ -471,10 +763,21 @@ def evaluate_arc_submission(
     # Run evaluation
     predictions = {}
     correct = 0
+    correct_pre_ttt = 0
     total = 0
 
     # Visualization data collection
     viz_data = [] if viz_path and VIZ_AVAILABLE else None
+
+    # Log file
+    log_file = open(log_path, 'w') if log_path else None
+    if log_file:
+        log_file.write(f"TOPAS Evaluation Log\n")
+        log_file.write(f"====================\n")
+        log_file.write(f"Checkpoint: {challenges_path}\n")
+        log_file.write(f"TTT Steps: {ttt_steps}, TTT LR: {ttt_lr}\n")
+        log_file.write(f"Augmentations: {num_aug} D8, Color Perms: {enable_color_perm} ({num_color_perms})\n")
+        log_file.write(f"\n{'='*80}\n\n")
 
     task_ids = list(challenges.keys())
     iterator = tqdm(task_ids, desc="Evaluating") if verbose else task_ids
@@ -491,7 +794,19 @@ def evaluate_arc_submission(
                 'test': [test_case]
             }
 
-            # Get predictions (top-3)
+            # === Pre-TTT prediction (baseline) ===
+            preds_pre = evaluator.solve_puzzle(
+                puzzle_data,
+                ttt_steps=0,  # No TTT
+                ttt_lr=ttt_lr,
+                num_aug=num_aug,
+                enable_ttt=False,
+                enable_color_perm=enable_color_perm,
+                num_color_perms=num_color_perms,
+                top_k=1
+            )
+
+            # === Post-TTT prediction ===
             preds = evaluator.solve_puzzle(
                 puzzle_data,
                 ttt_steps=ttt_steps,
@@ -503,32 +818,75 @@ def evaluate_arc_submission(
                 top_k=3
             )
 
-            # Convert to list format for submission
-            task_preds.append([pred.tolist() for pred in preds])
+            # Predictions are already cropped from solve_puzzle (TRM-style)
+            # Just convert to list format for submission
+            cropped_preds = [pred.tolist() for pred in preds]
+            task_preds.append(cropped_preds)
 
             # Check accuracy if solutions available
             if solutions and task_id in solutions:
-                expected = np.array(solutions[task_id][test_idx])
-                is_correct = np.array_equal(preds[0], expected)
+                expected_raw = np.array(solutions[task_id][test_idx])
+                eh, ew = expected_raw.shape
+
+                # === Pre-TTT accuracy (predictions are already cropped) ===
+                pred_pre = preds_pre[0]
+                ph_pre, pw_pre = pred_pre.shape
+                # Exact match: same shape AND same content
+                is_correct_pre = (ph_pre == eh and pw_pre == ew and
+                                  np.array_equal(pred_pre, expected_raw))
+                # Pixel accuracy: compare overlapping region
+                min_h_pre, min_w_pre = min(ph_pre, eh), min(pw_pre, ew)
+                if min_h_pre > 0 and min_w_pre > 0:
+                    overlap_correct_pre = (pred_pre[:min_h_pre, :min_w_pre] ==
+                                           expected_raw[:min_h_pre, :min_w_pre]).sum()
+                    pixel_acc_pre = overlap_correct_pre / expected_raw.size * 100
+                else:
+                    pixel_acc_pre = 0.0
+                if is_correct_pre:
+                    correct_pre_ttt += 1
+
+                # === Post-TTT accuracy (predictions are already cropped) ===
+                pred = preds[0]
+                ph, pw = pred.shape
+                # Exact match: same shape AND same content
+                is_correct = (ph == eh and pw == ew and
+                              np.array_equal(pred, expected_raw))
+                # Pixel accuracy: compare overlapping region
+                min_h, min_w = min(ph, eh), min(pw, ew)
+                if min_h > 0 and min_w > 0:
+                    overlap_correct = (pred[:min_h, :min_w] ==
+                                       expected_raw[:min_h, :min_w]).sum()
+                    pixel_acc = overlap_correct / expected_raw.size * 100
+                else:
+                    pixel_acc = 0.0
+
                 if is_correct:
                     correct += 1
                 total += 1
+
+                # Delta
+                pixel_delta = pixel_acc - pixel_acc_pre
+                delta_str = f"+{pixel_delta:.1f}" if pixel_delta >= 0 else f"{pixel_delta:.1f}"
 
                 # Dopamine logging
                 if verbose:
                     status = "SOLVED" if is_correct else "Failed"
                     icon = "+" if is_correct else "-"
                     acc_pct = (correct / total * 100) if total > 0 else 0.0
-                    # Pixel accuracy (compare overlapping region only)
-                    ph, pw = preds[0].shape
-                    eh, ew = expected.shape
-                    min_h, min_w = min(ph, eh), min(pw, ew)
-                    pred_crop = preds[0][:min_h, :min_w]
-                    exp_crop = expected[:min_h, :min_w]
-                    pixel_acc = (pred_crop == exp_crop).sum() / exp_crop.size * 100 if exp_crop.size > 0 else 0.0
-                    print(f"  [{icon}] {task_id}[{test_idx}]: {status} | ACC: {correct}/{total} ({acc_pct:.1f}%) | Pix: {pixel_acc:.1f}%", flush=True)
+                    pre_str = "PRE:SOLVED" if is_correct_pre else f"PRE:{pixel_acc_pre:.1f}%"
+                    shape_match = "✓" if (ph == eh and pw == ew) else f"✗ pred={ph}x{pw} exp={eh}x{ew}"
+                    print(f"  [{icon}] {task_id}[{test_idx}]: {status} | {shape_match} | ACC: {correct}/{total} ({acc_pct:.1f}%) | {pre_str} -> Pix: {pixel_acc:.1f}% ({delta_str})", flush=True)
 
-                # Collect visualization data
+                # Log file
+                if log_file:
+                    log_file.write(f"{task_id}[{test_idx}]\n")
+                    log_file.write(f"  Pre-TTT:  {'SOLVED' if is_correct_pre else 'Failed'} | Pix: {pixel_acc_pre:.1f}%\n")
+                    log_file.write(f"  Post-TTT: {'SOLVED' if is_correct else 'Failed'} | Pix: {pixel_acc:.1f}%\n")
+                    log_file.write(f"  Delta: {delta_str}%\n")
+                    log_file.write(f"\n")
+                    log_file.flush()
+
+                # Collect visualization data (use raw expected, not padded)
                 if viz_data is not None:
                     viz_data.append({
                         'task_id': task_id,
@@ -536,8 +894,8 @@ def evaluate_arc_submission(
                         'demos_in': [np.array(p['input']) for p in puzzle['train']],
                         'demos_out': [np.array(p['output']) for p in puzzle['train']],
                         'test_input': np.array(test_case['input']),
-                        'prediction': preds[0],
-                        'target': expected,
+                        'prediction': pred,
+                        'target': expected_raw,
                         'is_correct': is_correct
                     })
 
@@ -548,11 +906,29 @@ def evaluate_arc_submission(
 
     if solutions:
         accuracy = correct / total if total > 0 else 0.0
+        accuracy_pre = correct_pre_ttt / total if total > 0 else 0.0
         results['accuracy'] = accuracy
+        results['accuracy_pre_ttt'] = accuracy_pre
         results['correct'] = correct
+        results['correct_pre_ttt'] = correct_pre_ttt
         results['total'] = total
+
+        summary = f"\n{'='*60}\n"
+        summary += f"FINAL RESULTS\n"
+        summary += f"{'='*60}\n"
+        summary += f"Pre-TTT:  {correct_pre_ttt}/{total} = {accuracy_pre*100:.2f}%\n"
+        summary += f"Post-TTT: {correct}/{total} = {accuracy*100:.2f}%\n"
+        summary += f"TTT Delta: {correct - correct_pre_ttt:+d} solves ({(accuracy - accuracy_pre)*100:+.2f}%)\n"
+        summary += f"{'='*60}\n"
+
         if verbose:
-            print(f"\nAccuracy: {correct}/{total} = {accuracy*100:.2f}%")
+            print(summary)
+
+        if log_file:
+            log_file.write(summary)
+            log_file.close()
+            if verbose:
+                print(f"Saved log to: {log_path}")
 
     # Generate PDF visualization
     if viz_data and viz_path:
@@ -605,13 +981,6 @@ def _generate_eval_pdf(viz_data: List[Dict], output_path: str, correct: int, tot
                 target = data['target']
                 test_input = data['test_input']
 
-                # Ensure pred and target have same shape (crop both to overlapping region)
-                ph, pw = pred.shape
-                th, tw = target.shape
-                min_h, min_w = min(ph, th), min(pw, tw)
-                pred_cropped = pred[:min_h, :min_w]
-                target = target[:min_h, :min_w]
-
                 # Demo 1 (first demo pair)
                 if len(data['demos_in']) > 0:
                     plot_grid(axes[row, 0], data['demos_in'][0], "Demo In")
@@ -623,17 +992,22 @@ def _generate_eval_pdf(viz_data: List[Dict], output_path: str, correct: int, tot
                 # Test input
                 plot_grid(axes[row, 2], test_input, "Test Input")
 
-                # Prediction with status (show cropped version)
+                # Prediction with status (show full prediction)
                 status = "CORRECT" if data['is_correct'] else "WRONG"
                 color = 'green' if data['is_correct'] else 'red'
-                plot_grid(axes[row, 3], pred_cropped, f"Pred ({status})")
+                plot_grid(axes[row, 3], pred, f"Pred ({status})")
                 axes[row, 3].title.set_color(color)
 
-                # Target
+                # Target (show full target)
                 plot_grid(axes[row, 4], target, "Target")
 
-                # Error map (use cropped pred)
-                error_map = create_error_map(pred_cropped, target, pad_class=10)
+                # Error map - crop both to overlapping region for comparison
+                ph, pw = pred.shape
+                th, tw = target.shape
+                min_h, min_w = min(ph, th), min(pw, tw)
+                pred_for_error = pred[:min_h, :min_w]
+                target_for_error = target[:min_h, :min_w]
+                error_map = create_error_map(pred_for_error, target_for_error, pad_class=10)
                 plot_error_map(axes[row, 5], error_map, "Error Map")
 
                 # Add task ID as row label
@@ -746,14 +1120,15 @@ if __name__ == "__main__":
     parser.add_argument("--challenges", type=str, required=True, help="Challenges JSON path")
     parser.add_argument("--solutions", type=str, default=None, help="Solutions JSON path")
     parser.add_argument("--output", type=str, default="submission.json", help="Output path")
-    parser.add_argument("--ttt-steps", type=int, default=50, help="TTT optimization steps")
-    parser.add_argument("--ttt-lr", type=float, default=0.05, help="TTT learning rate")
+    parser.add_argument("--ttt-steps", type=int, default=10, help="TTT optimization steps")
+    parser.add_argument("--ttt-lr", type=float, default=0.01, help="TTT learning rate")
     parser.add_argument("--num-aug", type=int, default=8, help="Number of D8 augmentations")
     parser.add_argument("--no-ttt", action="store_true", help="Disable TTT")
     parser.add_argument("--no-color-perm", action="store_true", help="Disable color permutation TTA (enabled by default)")
     parser.add_argument("--num-color-perms", type=int, default=10, help="Number of color permutations")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--save-viz", type=str, default=None, help="Path to save PDF visualization")
+    parser.add_argument("--save-log", type=str, default=None, help="Path to save text log with pre/post TTT comparison")
 
     args = parser.parse_args()
 
@@ -799,7 +1174,8 @@ if __name__ == "__main__":
         enable_color_perm=not args.no_color_perm,
         num_color_perms=args.num_color_perms,
         verbose=True,
-        viz_path=args.save_viz
+        viz_path=args.save_viz,
+        log_path=args.save_log
     )
 
     # Save submission
