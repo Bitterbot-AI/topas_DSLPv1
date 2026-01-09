@@ -1,0 +1,93 @@
+# TOPAS-DSPL Configuration - H100 80GB Optimized
+# Target: Deep recursion + long state persistence
+# Reference: TRM uses batch=768 on A100
+
+model:
+  type: topas
+
+  # Model architecture
+  d_model: 480
+  n_heads: 8
+  expansion: 4.0
+  dropout: 0.1
+
+  # Recursive processing - MAXED for H100
+  H_cycles: 6              # 3 → 6: Deeper outer recursion
+  L_cycles: 6              # 4 → 6: More inner iterations per H
+  L_layers: 2              # Keep at 2 (memory scales with depth)
+
+  # Q-learning halting
+  halt_max_steps: 24       # 16 → 24: Allow more adaptive compute steps
+  halt_exploration_prob: 0.1
+
+  # ARC-specific
+  max_demos: 3
+  img_size: 30
+  num_colors: 11
+  num_program_tokens: 8    # 4 → 8: Larger working memory
+
+  # Puzzle embeddings - ENHANCED
+  puzzle_emb_ndim: 128     # 64 → 128: Richer puzzle memory
+  num_tasks: 100000
+
+training:
+  seed: 42
+  epochs_per_iter: 10
+
+  # Training data
+  train_data_dir: "/content/data"  # Colab path
+  eval_data_dir: ""
+
+  # Eval dataset paths
+  train_challenges: ""
+  train_solutions: ""
+  eval_challenges: "/content/data/arc-agi_evaluation_challenges.json"
+  eval_solutions: "/content/data/arc-agi_evaluation_solutions.json"
+
+  output_dir: "./output_topas"
+
+  # H100 80GB: batch=64 × accum=26 = 1664 effective
+  batch_size: 64
+  accumulation_steps: 26
+
+  epochs: 50000
+  learning_rate: 0.0001
+  amp: true
+  log_interval: 10
+  eval_interval: 5
+
+  # Phase 1 TBPTT: Variable H_cycles stress test - ENABLED
+  variable_h_cycles: true
+  h_cycles_min: 4          # Minimum recursion depth
+  h_cycles_max: 12         # Maximum recursion depth (stress test)
+
+  # Phase 2 TBPTT: State persistence - ENHANCED
+  tbptt_enabled: true
+  tbptt_reset_interval: 500  # 100 → 500: Longer state memory before reset
+
+regularization:
+  weight_decay: 0.0001
+  ema: true
+  ema_decay: 0.999
+  stream_dropout: 0.1
+  puzzle_emb_lr: 0.01
+  puzzle_emb_wd: 0.01
+  lr_warmup_steps: 500
+  lr_min_ratio: 0.01
+  freeze_weights: false
+
+loss_weights:
+  primary: 1.0
+  deep_supervision: 1.0
+  q_halt: 0.1
+  logic_consistency: 0.1
+  halting: 0.1
+  complexity: 0.01
+  change_weight: 1.0
+  object_count: 0.5
+  centroid: 0.0
+
+logging:
+  experiment_name: "topas_h100_tbptt"
+  use_tensorboard: true
+  vis_interval: 5

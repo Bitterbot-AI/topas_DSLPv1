@@ -364,6 +364,7 @@ class TOPASDSPLModel(nn.Module):
         return_intermediate: bool = False,
         min_steps: int = 0,
         object_mask: Optional[torch.Tensor] = None,
+        prev_z_L: Optional[torch.Tensor] = None,
         **kwargs
     ) -> Union[Tuple[torch.Tensor, torch.Tensor, None], Tuple]:
         """
@@ -376,11 +377,13 @@ class TOPASDSPLModel(nn.Module):
             demo_mask: [B, n_demos] mask for valid demos (True = invalid)
             task_ids: [B] task identifiers for puzzle embedding
             return_intermediate: Whether to return intermediate outputs
+            prev_z_L: Optional [B, SeqLen, D] previous logic state for TBPTT
 
         Returns:
             final_pixels: [B, C, H, W] predicted output grid
             q_logits: [B, 2] Q-values for halting
             None: placeholder for compatibility
+            (+ z_L if return_intermediate for TBPTT state persistence)
         """
         B = test_in.shape[0]
         device = test_in.device
@@ -390,6 +393,10 @@ class TOPASDSPLModel(nn.Module):
         z_C, z_L, valid_mask_2d = self._init_state(
             train_in, train_out, test_in, task_ids, demo_mask
         )
+
+        # TBPTT: Use previous logic state if provided (state persistence across batches)
+        if prev_z_L is not None and prev_z_L.shape == z_L.shape:
+            z_L = prev_z_L
 
         # Flatten valid mask for CanvasCore
         # [B, 1, H, W] -> [B, H*W, 1]
@@ -505,7 +512,8 @@ class TOPASDSPLModel(nn.Module):
                 ponder_cost,        # [4] ponder cost
                 final_q,            # [5] q_logits (Q-values for halting) - REQUIRED for TOPAS
                 obj_counts,         # [6] object count predictions
-                centroids           # [7] centroid predictions
+                centroids,          # [7] centroid predictions
+                z_L                 # [8] final logic state for TBPTT persistence
             )
 
         return final_pixels, final_q, None

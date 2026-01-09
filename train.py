@@ -1218,6 +1218,20 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
     logger.info(f"Batch size: {train_cfg['batch_size']} x {accumulation_steps} accumulation x {world_size} GPUs = {effective_batch_size} effective")
     logger.info(f"Loss weights: primary={w_primary}, deep={w_deep}, logic={w_logic}, halt={w_halt}, comp={w_comp}, obj={w_object}, centroid={w_centroid}, change={change_weight}")
 
+    # Phase 1 TBPTT: Variable H_cycles
+    if train_cfg.get("variable_h_cycles", False):
+        h_min = train_cfg.get("h_cycles_min", 3)
+        h_max = train_cfg.get("h_cycles_max", 12)
+        logger.info(f"Phase 1 TBPTT: Variable H_cycles enabled [{h_min}, {h_max}]")
+
+    # Phase 2 TBPTT: State persistence across batches
+    tbptt_enabled = train_cfg.get("tbptt_enabled", False)
+    tbptt_reset_interval = train_cfg.get("tbptt_reset_interval", 100)  # Reset states every N steps
+    tbptt_state_buffer = {}  # Dict[int, Tensor] - keyed by task_id
+    tbptt_step_counter = 0
+    if tbptt_enabled:
+        logger.info(f"Phase 2 TBPTT: State persistence enabled, reset every {tbptt_reset_interval} steps")
+
     best_nonbg_acc = 0.0
     global_step = start_step  # Initialize global step counter
     current_lr = 0.0  # Track current LR for logging
@@ -1434,7 +1448,38 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
 
             # Forward pass with task_ids and object_mask for puzzle embeddings
             # Check if model is TOPAS (has q_head) vs V3 (has object_count_head)
-            is_topas = hasattr(model, 'q_head')
+            is_topas = hasattr(raw_model, 'q_head')
+
+            # Phase 1 TBPTT Stress Test: Randomize H_cycles during training
+            # This tests model stability with variable recursion depth before full TBPTT
+            if is_topas and train_cfg.get("variable_h_cycles", False):
+                h_min = train_cfg.get("h_cycles_min", 3)
+                h_max = train_cfg.get("h_cycles_max", 12)
+                raw_model.H_cycles = random.randint(h_min, h_max)
+
+            # Phase 2 TBPTT: Retrieve previous states for this batch
+            prev_z_L = None
+            if tbptt_enabled and is_topas and task_ids is not None:
+                # Check if we should reset states
+                if tbptt_step_counter > 0 and tbptt_step_counter % tbptt_reset_interval == 0:
+                    tbptt_state_buffer.clear()
+
+                # Gather previous states for each task in batch
+                batch_prev_states = []
+                has_any_prev = False
+                for tid in task_ids.tolist():
+                    if tid in tbptt_state_buffer:
+                        batch_prev_states.append(tbptt_state_buffer[tid])
+                        has_any_prev = True
+                    else:
+                        batch_prev_states.append(None)
+
+                # Only use prev_z_L if ALL tasks have previous states (same shape requirement)
+                if has_any_prev and all(s is not None for s in batch_prev_states):
+                    # Check all have same shape
+                    shapes = [s.shape for s in batch_prev_states]
+                    if all(s == shapes[0] for s in shapes):
+                        prev_z_L = torch.stack(batch_prev_states, dim=0)
 
             if use_amp:
                 with torch.amp.autocast('cuda'):
@@ -1442,6 +1487,7 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
                         train_in, train_out, test_in, demo_mask,
                         task_ids=task_ids,
                         return_intermediate=True,
+                        prev_z_L=prev_z_L,
                         **({'return_logic_tokens': True, 'min_steps': current_min_steps, 'object_mask': test_in_obj_mask} if not is_topas else {})
                     )
                     final_logits, inter_logits_list, halting_list, logic_states, ponder_cost = result[:5]
@@ -1450,6 +1496,12 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
                     if is_topas:
                         q_logits = result[5]
                         object_count_logits, centroid_pred = None, None
+                        # Phase 2 TBPTT: Extract and store logic state for next batch
+                        if tbptt_enabled and len(result) > 8:
+                            z_L_out = result[8]  # [B, SeqLen, D]
+                            for i, tid in enumerate(task_ids.tolist()):
+                                tbptt_state_buffer[tid] = z_L_out[i].detach().clone()
+                            tbptt_step_counter += 1
                     else:
                         object_count_logits, centroid_pred = result[5], result[6]
                         q_logits = None
@@ -1468,6 +1520,7 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
                     train_in, train_out, test_in, demo_mask,
                     task_ids=task_ids,
                     return_intermediate=True,
+                    prev_z_L=prev_z_L,
                     **({'return_logic_tokens': True, 'min_steps': current_min_steps, 'object_mask': test_in_obj_mask} if not is_topas else {})
                 )
                 final_logits, inter_logits_list, halting_list, logic_states, ponder_cost = result[:5]
@@ -1475,6 +1528,12 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
                 if is_topas:
                     q_logits = result[5]
                     object_count_logits, centroid_pred = None, None
+                    # Phase 2 TBPTT: Extract and store logic state for next batch
+                    if tbptt_enabled and len(result) > 8:
+                        z_L_out = result[8]  # [B, SeqLen, D]
+                        for i, tid in enumerate(task_ids.tolist()):
+                            tbptt_state_buffer[tid] = z_L_out[i].detach().clone()
+                        tbptt_step_counter += 1
                 else:
                     object_count_logits, centroid_pred = result[5], result[6]
                     q_logits = None

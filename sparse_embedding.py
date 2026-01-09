@@ -29,10 +29,14 @@ class CastedSparseEmbedding(nn.Module):
             # Test mode, no gradient
             return self.weights[inputs].to(self.cast_to)
 
-        # Training mode, fill puzzle embedding from weights
+        # Training mode: create fresh tensor that's part of computation graph
+        # We gather from weights (detached), but return a grad-enabled tensor
         with torch.no_grad():
-            self.local_weights.copy_(self.weights[inputs])
             self.local_ids.copy_(inputs)
+
+        # Create a new tensor with gradients enabled in the computation graph
+        self.local_weights = self.weights[inputs].clone().requires_grad_(True)
+        self.local_weights.retain_grad()  # Retain grad for non-leaf tensor
 
         return self.local_weights.to(self.cast_to)
 
