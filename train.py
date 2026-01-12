@@ -183,6 +183,9 @@ class ARCEvalDataset(Dataset):
     Dataset for ARC evaluation from JSON files.
 
     Returns full task in V3 grid format (one-hot tensors with demos).
+
+    PATCHED: Handles tasks with multiple test inputs by flattening them,
+    so every subtask is evaluated.
     """
 
     def __init__(self, challenges_path, solutions_path, img_size=30, max_demos=3, num_colors=11):
@@ -203,10 +206,21 @@ class ARCEvalDataset(Dataset):
         with open(solutions_path, 'r') as f:
             self.solutions = json.load(f)
 
+        # SUBTASK PATCH: Flatten tasks with multiple test inputs
+        # Store list of (task_id, test_index) tuples
+        self.samples = []
         self.task_ids = list(self.challenges.keys())
 
+        for task_id in self.task_ids:
+            task = self.challenges[task_id]
+            # Add one sample per test input found in the task
+            for i in range(len(task['test'])):
+                self.samples.append((task_id, i))
+
+        print(f"ARCEvalDataset: Loaded {len(self.task_ids)} tasks yielding {len(self.samples)} test samples.")
+
     def __len__(self):
-        return len(self.task_ids)
+        return len(self.samples)
 
     def _grid_to_onehot(self, grid):
         """Convert 2D grid to one-hot tensor [C, H, W]."""
@@ -224,8 +238,9 @@ class ARCEvalDataset(Dataset):
         return onehot
 
     def __getitem__(self, idx):
-        """Get a full task in V3 format (demos + test)."""
-        task_id = self.task_ids[idx]
+        """Get a full task in V3 format (demos + specific test subtask)."""
+        # SUBTASK PATCH: Use flattened sample index to get (task_id, test_index)
+        task_id, test_idx = self.samples[idx]
         task = self.challenges[task_id]
         solution = self.solutions[task_id]
 
@@ -242,9 +257,9 @@ class ARCEvalDataset(Dataset):
             train_out[i] = self._grid_to_onehot(train_examples[i]['output'])
             demo_mask[i] = False  # Valid demo
 
-        # Process test example
-        test_input = task['test'][0]['input']
-        test_output = solution[0]
+        # Process specific test example using test_idx
+        test_input = task['test'][test_idx]['input']
+        test_output = solution[test_idx]
 
         test_in = self._grid_to_onehot(test_input)
         target_out = self._grid_to_onehot(test_output)

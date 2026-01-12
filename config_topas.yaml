@@ -26,8 +26,8 @@ model:
   num_colors: 11         # 10 colors (0-9) + 1 PAD class
   num_program_tokens: 4  # Multi-token program for complex transformations
 
-  # Puzzle embeddings (disabled for pretraining)
-  puzzle_emb_ndim: 0
+  # Puzzle embeddings (TRM Turbo Memory)
+  puzzle_emb_ndim: 64   # Enable sparse embedding with SignSGD
   num_tasks: 100000
 
 training:
@@ -50,13 +50,22 @@ training:
   eval_solutions: "/mnt/d/Bitterbot/research/topas_dslp/data/arc-agi_evaluation_solutions.json"
 
   output_dir: "./output_topas"
-  batch_size: 16         # Local batch size per forward pass
-  accumulation_steps: 88 # Effective batch = 16 * 88 = 1408
+  batch_size: 8          # Local batch size per forward pass (reduced for variable H_cycles)
+  accumulation_steps: 176 # Effective batch = 8 * 176 = 1408
   epochs: 50000          # More epochs to compensate for smaller epochs_per_iter
   learning_rate: 0.0001
   amp: true
   log_interval: 10       # Log every N batches
   eval_interval: 5       # Eval every 5 epochs
+
+  # Phase 1 TBPTT Stress Test: Variable recursion depth (disabled for Phase 2)
+  variable_h_cycles: false
+  h_cycles_min: 3
+  h_cycles_max: 6
+
+  # Phase 2 TBPTT: State persistence across batches
+  tbptt_enabled: true
+  tbptt_reset_interval: 100  # Reset states every N steps to prevent drift
 
 regularization:
   weight_decay: 0.0001
@@ -81,6 +90,6 @@ loss_weights:
   centroid: 0.0          # Disabled - revisit with per-color centroids later
 
 logging:
-  experiment_name: "topas_8m_v2"
+  experiment_name: "topas_turbo_phase2"
   use_tensorboard: true
   vis_interval: 5

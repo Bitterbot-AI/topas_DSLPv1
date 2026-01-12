@@ -318,7 +318,14 @@ class TOPASDSPLModel(nn.Module):
 
         # 1. Puzzle Embedding (Prior / Long-term memory)
         if self.puzzle_emb is not None and task_ids is not None:
-            p_emb = self.puzzle_emb(task_ids)
+            # SAFETY PATCH: Dynamic clamp to prevent CUDA index out of bounds
+            # when task_ids exceed the embedding table size
+            emb_size = (self.puzzle_emb.weights.shape[0]
+                        if hasattr(self.puzzle_emb, 'weights')
+                        else getattr(self.puzzle_emb, 'num_embeddings', task_ids.max().item() + 1))
+            clamped_ids = task_ids % emb_size
+
+            p_emb = self.puzzle_emb(clamped_ids)
             if hasattr(self, 'puzzle_proj'):
                 p_emb = self.puzzle_proj(p_emb)
             logic_parts.append(p_emb.unsqueeze(1))  # [B, 1, D]
