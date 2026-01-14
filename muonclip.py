@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # trainers/k2_muonclip.py
 """
-K2-style MuonClip optimizer wrapper for TOPAS/BitterBot Brain
+MuonClip optimizer wrapper for TOPAS/BitterBot Brain
 
 Core idea:
 - Track the maximum pre-softmax attention logits (per head) produced by Q·K / sqrt(d).
