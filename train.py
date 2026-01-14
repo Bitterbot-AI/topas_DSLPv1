@@ -1134,6 +1134,7 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
     # Resume from checkpoint if provided
     start_epoch = 1
     start_step = 0  # Global step counter for LR scheduling
+    fresh_optimizer = train_cfg.get("fresh_optimizer", False)  # Set True for fine-tuning with reset optimizer
     if resume_checkpoint and os.path.exists(resume_checkpoint):
         logger.info(f"Resuming from checkpoint: {resume_checkpoint}")
         checkpoint = torch.load(resume_checkpoint, map_location=device, weights_only=False)
@@ -1142,13 +1143,33 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
             model.module.load_state_dict(model_state, strict=False)
         else:
             model.load_state_dict(model_state, strict=False)
-        # Skip optimizer state - incompatible between v1 (AdamW) and v3 (AdamAtan2)
-        # Start fresh with new optimizer but keep model weights
         # Note: strict=False allows new heads (e.g., object_count_head) to be randomly initialized
-        logger.info("Skipping optimizer state load (fresh optimizer for fine-tuning)")
         start_epoch = checkpoint['epoch'] + 1
-        start_step = 0  # Reset step counter - fresh optimizer means fresh LR schedule
-        logger.info(f"Loaded model from epoch {checkpoint['epoch']}, restarting training from epoch {start_epoch}")
+
+        if fresh_optimizer:
+            # Fresh optimizer for fine-tuning scenarios
+            logger.info("Using fresh optimizer (fresh_optimizer=True)")
+            start_step = 0
+        else:
+            # Restore optimizer state and step counter for true resume
+            if 'optimizer_state_dict' in checkpoint:
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    logger.info("Restored optimizer state from checkpoint")
+                except Exception as e:
+                    logger.warning(f"Failed to load optimizer state: {e}. Using fresh optimizer.")
+
+            # Restore global step from extra_state if available
+            extra = checkpoint.get('extra', {})
+            if extra and 'global_step' in extra:
+                start_step = extra['global_step']
+                logger.info(f"Restored global_step: {start_step}")
+            else:
+                # Fallback: estimate step from epoch (approximate)
+                logger.warning("No global_step in checkpoint, starting from step 0")
+                start_step = 0
+
+        logger.info(f"Loaded model from epoch {checkpoint['epoch']}, resuming from epoch {start_epoch}, step {start_step}")
 
     # Optional: Freeze canvas core for fine-tuning stability
     freeze_canvas = reg_cfg.get("freeze_canvas_core", False)
@@ -1247,7 +1268,6 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
     if tbptt_enabled:
         logger.info(f"Phase 2 TBPTT: State persistence enabled, reset every {tbptt_reset_interval} steps")
 
-    best_nonbg_acc = 0.0
     global_step = start_step  # Initialize global step counter
     current_lr = 0.0  # Track current LR for logging
     model.train()
@@ -1424,7 +1444,8 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
                             logger.warning(f"Failed to generate PDF visualization: {e}")
 
                         # Save checkpoint after each step-based eval (crash protection)
-                        logger.save_checkpoint(model, optimizer, epoch, best=False, suffix=f"_step{global_step}")
+                        logger.save_checkpoint(model, optimizer, epoch, best=False, suffix=f"_step{global_step}",
+                                               extra_state={'global_step': global_step})
                         logger.info(f"[Step {global_step}] Checkpoint saved")
 
                     # Reset accumulation metrics after optimizer step
@@ -1728,7 +1749,8 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
                         logger.warning(f"Failed to generate PDF visualization: {e}")
 
                     # Save checkpoint after each step-based eval (crash protection)
-                    logger.save_checkpoint(model, optimizer, epoch, best=False, suffix=f"_step{global_step}")
+                    logger.save_checkpoint(model, optimizer, epoch, best=False, suffix=f"_step{global_step}",
+                                           extra_state={'global_step': global_step})
                     logger.info(f"[Step {global_step}] Checkpoint saved")
 
                 # Update EMA model
@@ -1877,16 +1899,17 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
                     _, inter_logits, halt_probs = result[0], result[1], result[2]
                     logger.log_halting_probs(epoch, halt_probs)
 
-            # Save best model based on Non-BG accuracy
-            if nonzero_acc > best_nonbg_acc:
-                best_nonbg_acc = nonzero_acc
-                logger.save_checkpoint(model, optimizer, epoch, best=True, suffix="_nonbg")
-                logger.info(f"New best model saved (Non-BG Acc): {nonzero_acc*100:.2f}%")
+            # Save periodic checkpoint every 50 epochs
+            if epoch % 50 == 0:
+                logger.save_checkpoint(model, optimizer, epoch, best=False, suffix=f"_epoch{epoch}",
+                                       extra_state={'global_step': global_step})
+                logger.info(f"Periodic checkpoint saved at epoch {epoch}")
 
     # Save final model and close logger
     if rank == 0:
-        logger.save_checkpoint(model, optimizer, num_epochs, best=False)
-        logger.info(f"Best Non-BG accuracy achieved: {best_nonbg_acc*100:.2f}%")
+        logger.save_checkpoint(model, optimizer, num_epochs, best=False,
+                               extra_state={'global_step': global_step})
+        logger.info("Training complete. Final checkpoint saved.")
         logger.close()
 
 
