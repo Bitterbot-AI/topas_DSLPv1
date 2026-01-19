@@ -614,6 +614,13 @@ def evaluate(model, eval_data, device, num_classes=11, verbose=True, task_id_off
             if isinstance(batch, dict):
                 continue
 
+            # --- ROBUSTNESS PATCH START ---
+            # Initialize variables to prevent UnboundLocalError
+            task_ids = None
+            content_mask = None
+            test_in_obj_mask = None
+            # --- ROBUSTNESS PATCH END ---
+
             # V3 tuple-style batch (one-hot grids)
             # Handle different tuple formats:
             # 8-tuple: with object mask (newest)
@@ -1165,9 +1172,9 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
                 start_step = extra['global_step']
                 logger.info(f"Restored global_step: {start_step}")
             else:
-                # Fallback: estimate step from epoch (approximate)
-                logger.warning("No global_step in checkpoint, starting from step 0")
-                start_step = 0
+                # Fallback: estimate step from epoch to prevent LR warmup restart
+                start_step = (start_epoch - 1) * steps_per_iter
+                logger.warning(f"No global_step in checkpoint. Estimated start_step: {start_step} (from epoch {start_epoch})")
 
         logger.info(f"Loaded model from epoch {checkpoint['epoch']}, resuming from epoch {start_epoch}, step {start_step}")
 
@@ -1267,6 +1274,11 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
     tbptt_step_counter = 0
     if tbptt_enabled:
         logger.info(f"Phase 2 TBPTT: State persistence enabled, reset every {tbptt_reset_interval} steps")
+
+    # --- PERSISTENCE LOGGING PATCH START ---
+    task_last_seen = {}
+    recurrence_distances = []
+    # --- PERSISTENCE LOGGING PATCH END ---
 
     global_step = start_step  # Initialize global step counter
     current_lr = 0.0  # Track current LR for logging
@@ -1478,6 +1490,23 @@ def train(config_path="config.yaml", resume_checkpoint=None, use_tpu=False, tpu_
             target_out = target_out.to(device)
             demo_mask = demo_mask.to(device)
             task_ids = task_ids.to(device)
+
+            # --- PERSISTENCE LOGGING PATCH START ---
+            # Track Recurrence to validate Infinite Persistence
+            if task_ids is not None:
+                current_step_val = global_step
+                for tid in task_ids.tolist():
+                    if tid in task_last_seen:
+                        dist = current_step_val - task_last_seen[tid]
+                        recurrence_distances.append(dist)
+                    task_last_seen[tid] = current_step_val
+
+            # Log stats every 100 steps
+            if global_step % 100 == 0 and len(recurrence_distances) > 0 and rank == 0:
+                avg_dist = sum(recurrence_distances) / len(recurrence_distances)
+                logger.info(f"[Stats] Average Task Recurrence: {avg_dist:.1f} steps")
+                recurrence_distances = []  # Reset buffer
+            # --- PERSISTENCE LOGGING PATCH END ---
 
             # Compute target object counts and centroids for auxiliary loss
             target_object_counts, target_centroids = compute_batch_object_info(target_out) if (w_object > 0 or w_centroid > 0) else (None, None)

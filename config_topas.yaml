@@ -65,7 +65,7 @@ training:
 
   # Phase 2 TBPTT: State persistence across batches
   tbptt_enabled: true
-  tbptt_reset_interval: 100  # Reset states every N steps to prevent drift
+  tbptt_reset_interval: 10000000  # Virtually infinite (disabled reset)
 
 regularization:
   weight_decay: 0.0001
